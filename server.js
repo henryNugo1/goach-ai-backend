@@ -3592,7 +3592,7 @@ Use this profile context carefully:
 /* -------------------------------- ROUTES ------------------------------- */
 
 app.get("/", (req, res) => {
-  res.send("AI backend is running Ã°Å¸Å¡â‚¬");
+  res.send("AI backend is running");
 });
 
 app.post("/auth/request-password-reset", async (req, res) => {
