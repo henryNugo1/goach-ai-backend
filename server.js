@@ -6161,6 +6161,16 @@ const getRecentEditThreadInstruction = (messages = [], latestText = "") => {
   return hasEditIntent && hasConcreteDetail ? combined : "";
 };
 
+const previousAssistantAskedToApplyEdit = (message = "") => {
+  const text = normalizeCoachTextForComparison(message);
+  if (!text) return false;
+
+  return (
+    /\b(update it|build it|generate|apply|make the change|save the change|should i update|want me to update|do you want me to update|update it or keep it|keep it as it is)\b/.test(text) ||
+    (/\b(update|change|add|remove|edit)\b/.test(text) && /\?$/.test(String(message).trim()))
+  );
+};
+
 const buildContextualEditInstruction = ({
   messages = [],
   latestText = "",
@@ -6279,7 +6289,8 @@ If user refuses to give a reason:
 
 Confirmation:
 - If the user clearly confirms a pending edit in natural language, set action="generate_plan" and canGeneratePlan=true.
-- If the user's meaning is unclear, set action="reply_only", canGeneratePlan=false, and ask: "Do you mean I should update it, or keep it as it is?"
+- If you already asked whether to update/apply/build/save the change and the user accepts by meaning, set action="generate_plan" and canGeneratePlan=true. Do not ask the same confirmation again.
+- If the user's meaning is truly unclear and does not answer the previous question, set action="reply_only", canGeneratePlan=false, and ask one natural clarification. Do not repeat the same clarification twice.
 - If the user gives another edit before generating, acknowledge the updated edit and set action="ready_to_generate" only if the reason rule is already satisfied.
 - If the user is questioning your understanding, complaining, correcting you, or asking "do you understand", answer naturally and set action="reply_only" and canGeneratePlan=false.
 - Do not say "I removed", "I added", "I updated", or "I changed", because no plan has been generated yet.
@@ -6340,14 +6351,24 @@ Reply as the coach. Do not generate a plan.`,
     });
     const parsedAction = String(parsed?.action ?? "reply_only").trim();
     const parsedReply = String(parsed?.reply ?? "").trim();
+    const latestEditConfirmationIntent = classifyConfirmationReply(latestEditInstruction);
+    const shouldGenerateConfirmedEdit =
+      previousAssistantAskedToApplyEdit(lastAssistantQuestion) &&
+      latestEditConfirmationIntent === "accept" &&
+      Boolean(contextualPendingEdit || fallbackPendingEdit);
     const shouldClarifyAmbiguousReply =
+      !shouldGenerateConfirmedEdit &&
       Boolean(lastAssistantQuestion) &&
       isBriefAmbiguousReply(latestEditInstruction) &&
       parsedAction !== "generate_plan" &&
       parsedAction !== "ready_to_generate" &&
       !Boolean(parsed?.canGeneratePlan);
 
-    const action = shouldClarifyAmbiguousReply ? "reply_only" : parsedAction;
+    const action = shouldGenerateConfirmedEdit
+      ? "generate_plan"
+      : shouldClarifyAmbiguousReply
+        ? "reply_only"
+        : parsedAction;
     const parsedPendingEditInstruction = String(parsed?.pendingEditInstruction ?? "").trim();
     const pendingEditInstruction = String(
       contextualPendingEdit &&
@@ -6357,7 +6378,9 @@ Reply as the coach. Do not generate a plan.`,
     ).trim();
     const reply = shouldClarifyAmbiguousReply
       ? "Do you mean I should update it, or keep it as it is?"
-      : parsedReply;
+      : shouldGenerateConfirmedEdit
+        ? "Got it. I’ll update it now."
+        : parsedReply;
 
     const remainingCredits = await deductCreditsAfterSuccess(req);
 
