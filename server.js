@@ -173,6 +173,7 @@ const normalizeGoalSessionTimes = (
     .map((item) => ({
       startTime: normalizeGoalTimeValue(item?.startTime),
       endTime: normalizeGoalTimeValue(item?.endTime),
+      label: String(item?.label ?? item?.purpose ?? item?.title ?? "").trim(),
     }))
     .filter(
       (item) =>
@@ -180,7 +181,7 @@ const normalizeGoalSessionTimes = (
         item.endTime &&
         item.startTime !== item.endTime,
     )
-    .slice(0, 4);
+    .slice(0, 8);
 };
 
 const addMinutesToTime = (timeValue = "", minutesToAdd = 60) => {
@@ -245,6 +246,71 @@ const inferSingleSessionTimeFromText = (text = "") => {
   }
 
   return sessions.slice(0, 4);
+};
+
+const getReminderDurationMinutes = (label = "") => {
+  const text = normalizeCoachTextForComparison(label);
+
+  if (/\b(wake|wake up|waking|get up)\b/.test(text)) return 15;
+  if (/\b(bed|bedtime|bed time|sleep|sleeping)\b/.test(text)) return 30;
+  if (/\b(lunch|breakfast|dinner|meal|food|snack)\b/.test(text)) return 45;
+  if (/\b(workout|exercise|gym|training|walk|run)\b/.test(text)) return 60;
+  return 15;
+};
+
+const normalizeReminderLabel = (label = "") => {
+  const cleaned = String(label ?? "")
+    .replace(/[_:;,.]+/g, " ")
+    .replace(/\b(time|alert|notification|reminder|by|at|for)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!cleaned) return "Reminder";
+
+  return cleaned
+    .split(" ")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+    .join(" ");
+};
+
+const inferLabeledReminderSessionTimesFromText = (text = "") => {
+  const raw = String(text ?? "");
+  const lower = raw.toLowerCase();
+  const reminderIntent =
+    /\b(notification|notifications|reminder|reminders|alert|alerts|wake|waking|wake up|bed|bedtime|bed time|sleep|sleeping|workout|exercise|gym|lunch|breakfast|dinner|meal|snack)\b/.test(lower);
+  if (!reminderIntent) return [];
+
+  const parts = raw
+    .split(/[,;\n]+|\band\b/gi)
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const sessions = [];
+  const seen = new Set();
+  const timePattern = /(\d{1,2})(?::|\s)?(\d{2})?\s*(am|pm)?/i;
+
+  for (const part of parts) {
+    const match = part.match(timePattern);
+    if (!match) continue;
+
+    const time = normalizeGoalTimeValue(`${match[1]}${match[2] ?? ""}${match[3] ?? ""}`);
+    if (!time || seen.has(time)) continue;
+
+    const rawLabel = part.slice(0, match.index).replace(/[-=–—>]+/g, " ").trim();
+    const label = normalizeReminderLabel(rawLabel);
+    const duration = getReminderDurationMinutes(label || part);
+
+    seen.add(time);
+    sessions.push({
+      startTime: time,
+      endTime: addMinutesToTime(time, duration),
+      inferredEndTime: false,
+      label,
+      purpose: label,
+    });
+  }
+
+  return sessions.slice(0, 8);
 };
 
 const inferSleepSessionTimesFromText = (text = "") => {
@@ -1625,13 +1691,13 @@ const isDirectClarificationQuestion = (message = "") => {
   const text = normalizeCoachTextForComparison(message);
   if (!text) return false;
 
-  if (text.length <= 24 && /^(what|why|y|how|who|which|huh|meaning|explain)\b/.test(text)) {
+  if (text.length <= 32 && /^(what|why|y|how|who|which|when|where|huh|meaning|explain)\b/.test(text)) {
     return true;
   }
 
   return (
     /\?$/.test(String(message).trim()) ||
-    /\b(what is|what are|what do you mean|what does|why|how does|how do|who is|which one|explain|i don t get|i dont get|i don t understand|i dont understand|huh)\b/.test(text)
+    /\b(what is|what are|what do you mean|what does|why|when did|where did|how does|how do|who is|which one|explain|i don t get|i dont get|i don t understand|i dont understand|huh)\b/.test(text)
   );
 };
 
@@ -2187,10 +2253,13 @@ const buildGoalFinalSummaryReply = (goalDraft = {}) => {
     details.push(
       sessionTimes
         .map(
-          (session) =>
-            `${formatGoalTimeForUser(session.startTime)} to ${formatGoalTimeForUser(
+          (session) => {
+            const label = String(session?.label ?? "").trim();
+            const timeText = `${formatGoalTimeForUser(session.startTime)} to ${formatGoalTimeForUser(
               session.endTime,
-            )}`,
+            )}`;
+            return label ? `${label}: ${timeText}` : timeText;
+          },
         )
         .join(", "),
     );
@@ -2558,6 +2627,82 @@ const removeDuplicatePreferredSessionShifts = (planItems = []) => {
     seen.add(key);
     return true;
   });
+};
+
+const getReminderCategoryFromLabel = (label = "") => {
+  const text = normalizeCoachTextForComparison(label);
+
+  if (/\b(bed|sleep|wake)\b/.test(text)) return "sleep";
+  if (/\b(workout|exercise|gym|training|walk|run)\b/.test(text)) return "workout";
+  if (/\b(lunch|breakfast|dinner|meal|food|snack)\b/.test(text)) return "cooking";
+  if (/\b(study|read|exam|school|learn)\b/.test(text)) return "study";
+  if (/\b(pray|meditat|breath)\b/.test(text)) return "meditation";
+  return "meditation";
+};
+
+const getReminderExplanation = (label = "", startTime = "") => {
+  const cleanLabel = normalizeReminderLabel(label);
+  const timeText = formatGoalTimeForUser(startTime);
+  const lower = normalizeCoachTextForComparison(cleanLabel);
+
+  if (/\b(wake|wake up|waking)\b/.test(lower)) {
+    return `Wake up at ${timeText}. Get out of bed, drink water, and start your day without scrolling first. This keeps the routine clear and easy to repeat.`;
+  }
+  if (/\b(bed|bedtime|sleep)\b/.test(lower)) {
+    return `Start bedtime at ${timeText}. Put the phone away, dim the room, and let your body settle down. This helps your sleep routine stay steady.`;
+  }
+  if (/\b(workout|exercise|gym|training)\b/.test(lower)) {
+    return `Start your workout at ${timeText}. Warm up first, follow the planned movement, and finish with a short stretch. This keeps your body active on schedule.`;
+  }
+  if (/\b(lunch|breakfast|dinner|meal|food|snack)\b/.test(lower)) {
+    return `${cleanLabel} starts at ${timeText}. Eat calmly, include something filling, and avoid rushing the meal. This helps your daily routine stay balanced.`;
+  }
+
+  return `${cleanLabel} starts at ${timeText}. Pause, do the reminder action, and mark it done when finished. This keeps the routine easy to follow.`;
+};
+
+const buildReminderPlanFromGoalMeta = (currentGoalMeta = null) => {
+  const selectedDays = normalizeGoalSelectedDays(currentGoalMeta?.selectedDays);
+  const sessionTimes = normalizeGoalSessionTimes(
+    currentGoalMeta?.sessionTimes,
+    currentGoalMeta?.sessionTime,
+  );
+  const searchText = getGoalDraftSearchText(currentGoalMeta);
+  const hasReminderShape =
+    sessionTimes.length > 1 &&
+    (
+      /\b(reminder|reminders|notification|notifications|alert|alerts)\b/.test(searchText) ||
+      sessionTimes.some((session) => String(session?.label ?? "").trim())
+    );
+
+  if (!hasReminderShape || selectedDays.length === 0) return null;
+
+  const plan = [];
+  for (const day of selectedDays) {
+    for (const session of sessionTimes) {
+      const label = normalizeReminderLabel(session.label || "Reminder");
+      plan.push({
+        title: label,
+        startTime: session.startTime,
+        endTime: session.endTime,
+        explanation: getReminderExplanation(label, session.startTime),
+        category: getReminderCategoryFromLabel(label),
+        imageSearchQuery: `${label} reminder routine`,
+        timeframeType: "day",
+        timeframeValue: 1,
+        targetType: "weekday",
+        difficultyLevel: "basic",
+        weekdayLabel: day,
+        plannedDate: "",
+        targetKey: day,
+        targetLabel: day,
+        phaseLabel: "Daily Routine",
+        resourceLinks: [],
+      });
+    }
+  }
+
+  return plan;
 };
 
 const autoAdjustPlanAgainstExistingSchedule = (
@@ -4292,7 +4437,17 @@ app.post("/generate-next-question", checkCredits, async (req, res) => {
     const previousAssistantAskedForApproval = /\b(does that work|does this work|does that look right|is that ok|is this ok|are you okay with that|should i use that|can i use that)\b/i.test(
       previousAssistantReply,
     );
-    const userAcceptedSummary = previousAssistantWasSummary && isLikelyAcceptanceReply(latestUserMessage);
+    const userChallengedSummary =
+      previousAssistantWasSummary &&
+      (
+        latestUserAskedDirectQuestion ||
+        /\b(when|why|where|how)\b[\s\S]{0,80}\b(agree|agreed|choose|chose|said|tell|told|use|used)\b/i.test(latestUserMessage) ||
+        /\b(i did not|i didn t|i dont|i don t|i never|not right|wrong|that is not|that's not|no that|nope)\b/i.test(latestUserMessage)
+      );
+    const userAcceptedSummary =
+      previousAssistantWasSummary &&
+      !userChallengedSummary &&
+      isLikelyAcceptanceReply(latestUserMessage);
     const userAcceptedPendingSuggestion =
       !previousAssistantWasSummary &&
       previousAssistantAskedForApproval &&
@@ -4632,6 +4787,7 @@ Generate the next Goach reply now.`,
             sessionTimes: pendingSessionTimes.map((session) => ({
               startTime: session.startTime,
               endTime: addMinutesToTime(session.startTime, pendingSessionDurationMinutes),
+              label: session.label,
             })),
             reason: `${pendingSessionDurationMinutes}-minute session length accepted`,
           }
@@ -4718,10 +4874,15 @@ Generate the next Goach reply now.`,
       incomingGoalDraft.sessionTimes,
       incomingGoalDraft.sessionTime,
     );
-    const inferredSleepSessionTimes = inferSleepSessionTimesFromText(latestUserMessage);
-    const inferredSessionTimes = inferredSleepSessionTimes.length > 0
-      ? inferredSleepSessionTimes
-      : inferSingleSessionTimeFromText(latestUserMessage);
+    const inferredLabeledReminderSessionTimes = inferLabeledReminderSessionTimesFromText(latestUserMessage);
+    const inferredSleepSessionTimes = inferredLabeledReminderSessionTimes.length > 0
+      ? []
+      : inferSleepSessionTimesFromText(latestUserMessage);
+    const inferredSessionTimes = inferredLabeledReminderSessionTimes.length > 0
+      ? inferredLabeledReminderSessionTimes
+      : inferredSleepSessionTimes.length > 0
+        ? inferredSleepSessionTimes
+        : inferSingleSessionTimeFromText(latestUserMessage);
     const previousAskedForTime = /\b(time|what time|when should|when do you want|time of day)\b/i.test(previousAssistantReply);
     const inferredSessionNeedsConfirmation = inferredSessionTimes.some((session) => session.inferredEndTime);
     const inferredSessionsLookMoreComplete =
@@ -4732,7 +4893,7 @@ Generate the next Goach reply now.`,
       currentSessionTimes.length === 0 &&
       incomingSessionTimes.length === 0 &&
       inferredSessionTimes.length > 0 &&
-      (previousAskedForTime || inferredSleepSessionTimes.length > 0) &&
+      (previousAskedForTime || inferredSleepSessionTimes.length > 0 || inferredLabeledReminderSessionTimes.length > 0) &&
       !inferredSessionNeedsConfirmation;
     const sessionTimes = inferredSessionsLookMoreComplete
       ? inferredSessionTimes
@@ -4820,7 +4981,7 @@ Generate the next Goach reply now.`,
                 ...(isPlainObject(incomingGoalDraft.pendingSuggestion)
                   ? incomingGoalDraft.pendingSuggestion
                   : currentDraft.pendingSuggestion),
-                sessionTimes: inferredSessionTimes.map(({ startTime, endTime }) => ({ startTime, endTime })),
+                sessionTimes: inferredSessionTimes.map(({ startTime, endTime, label }) => ({ startTime, endTime, label })),
                 reason: "suggested session end time",
               }
             : isPlainObject(incomingGoalDraft.pendingSuggestion)
@@ -5120,6 +5281,12 @@ Generate the next Goach reply now.`,
       goalDraft.shouldBuildGoalCard &&
       !goalDraft.finalSummaryConfirmed &&
       !latestUserAskedDirectQuestion;
+
+    if (userChallengedSummary && checklistComplete && goalDraft.shouldBuildGoalCard) {
+      reply = `You are right to question that. I should use the details you gave, not shrink the plan. ${buildGoalFinalSummaryReply(goalDraft)}`;
+      goalDraft.finalSummaryOffered = true;
+      goalDraft.finalSummaryConfirmed = false;
+    }
 
     if (
       !goalDraft.shouldBuildGoalCard &&
@@ -5715,8 +5882,8 @@ Build a realistic long-term roadmap in your reasoning, but output only the next 
       });
     }
 
-
-     const preferredTimePlan = applyPreferredSessionTimesToPlan(
+    const reminderPlan = buildReminderPlanFromGoalMeta(currentGoalMeta);
+    const preferredTimePlan = reminderPlan || applyPreferredSessionTimesToPlan(
       rawPlan,
       currentGoalMeta,
     );
@@ -5745,6 +5912,18 @@ Build a realistic long-term roadmap in your reasoning, but output only the next 
     const normalizedGeneratedGoalMeta = {
       ...(currentGoalMeta ?? {}),
       ...(rawGoalMeta ?? {}),
+      selectedDays: currentMetaDays.length > 0
+        ? currentMetaDays
+        : rawMetaDays,
+      routineMode: currentMetaDays.length >= 7 || rawMetaDays.length >= 7
+        ? "everyday"
+        : String(rawGoalMeta?.routineMode ?? currentGoalMeta?.routineMode ?? "").trim(),
+      sessionTimes: normalizeGoalSessionTimes(
+        currentGoalMeta?.sessionTimes,
+        currentGoalMeta?.sessionTime,
+      ).length > 0
+        ? normalizeGoalSessionTimes(currentGoalMeta?.sessionTimes, currentGoalMeta?.sessionTime)
+        : normalizeGoalSessionTimes(rawGoalMeta?.sessionTimes, rawGoalMeta?.sessionTime),
       goalEndDate: isOpenEndedEverydayRoutine
         ? ""
         : rawGoalMeta?.goalEndDate || currentGoalMeta?.goalEndDate || "",
