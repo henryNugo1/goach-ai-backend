@@ -2705,6 +2705,139 @@ const buildReminderPlanFromGoalMeta = (currentGoalMeta = null) => {
   return plan;
 };
 
+const inferReminderEditSessionTimesFromText = (text = "") => {
+  const direct = inferLabeledReminderSessionTimesFromText(text).filter((session) => {
+    const label = normalizeCoachTextForComparison(session?.label);
+    return label && !/\b(extra detail|reminder)\b/.test(label);
+  });
+  if (direct.length > 0) return direct;
+
+  const sourceText = String(text ?? "");
+  const normalized = normalizeCoachTextForComparison(sourceText);
+  const labels = [];
+  const addLabel = (label) => {
+    if (!labels.includes(label)) labels.push(label);
+  };
+
+  if (/\b(lunch|midday meal)\b/.test(normalized)) addLabel("Lunch");
+  if (/\b(breakfast|morning meal)\b/.test(normalized)) addLabel("Breakfast");
+  if (/\b(dinner|night meal|supper)\b/.test(normalized)) addLabel("Dinner");
+  if (/\b(snack|snacks)\b/.test(normalized)) addLabel("Snack");
+  if (/\b(workout|exercise|gym|training)\b/.test(normalized)) addLabel("Workout");
+  if (/\b(bed|bedtime|bed time|sleep|sleeping)\b/.test(normalized)) addLabel("Bedtime");
+  if (/\b(wake|wake up|waking|get up)\b/.test(normalized)) addLabel("Wake Up");
+
+  if (labels.length === 0) return [];
+
+  const times = inferSingleSessionTimeFromText(sourceText);
+  if (times.length === 0) return [];
+
+  return times.slice(0, labels.length).map((session, index) => {
+    const label = labels[index] || labels[0] || "Reminder";
+    return {
+      startTime: session.startTime,
+      endTime: addMinutesToTime(session.startTime, getReminderDurationMinutes(label)),
+      inferredEndTime: false,
+      label,
+      purpose: label,
+    };
+  });
+};
+
+const getPlanSelectedDays = (planItems = []) => {
+  return normalizeGoalSelectedDays(
+    (Array.isArray(planItems) ? planItems : [])
+      .filter((item) => String(item?.targetType ?? "weekday") === "weekday")
+      .map((item) => item?.weekdayLabel),
+  );
+};
+
+const mergeGoalSessionTimes = (existing = [], additions = []) => {
+  const merged = [];
+  const seen = new Set();
+
+  for (const session of [...normalizeGoalSessionTimes(existing), ...normalizeGoalSessionTimes(additions)]) {
+    const key = `${session.startTime}|${session.endTime}|${normalizeCoachTextForComparison(session.label)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(session);
+  }
+
+  return merged.slice(0, 8);
+};
+
+const applyReminderAddEditToPlan = ({
+  planItems = [],
+  currentGoalMeta = null,
+  editInstruction = "",
+  conversationText = "",
+} = {}) => {
+  const text = `${conversationText}\n${editInstruction}`;
+  const normalized = normalizeCoachTextForComparison(text);
+  const wantsAdd =
+    /\b(add|include|create|put|insert|also|as well|new)\b/.test(normalized) &&
+    /\b(reminder|notification|alert|lunch|breakfast|dinner|snack|workout|exercise|bed|sleep|wake)\b/.test(normalized);
+
+  if (!wantsAdd) {
+    return { plan: planItems, addedSessions: [] };
+  }
+
+  const reminderSessions = inferReminderEditSessionTimesFromText(text);
+  if (reminderSessions.length === 0) {
+    return { plan: planItems, addedSessions: [] };
+  }
+
+  const selectedDays =
+    normalizeGoalSelectedDays(currentGoalMeta?.selectedDays).length > 0
+      ? normalizeGoalSelectedDays(currentGoalMeta?.selectedDays)
+      : getPlanSelectedDays(planItems);
+
+  if (selectedDays.length === 0) {
+    return { plan: planItems, addedSessions: [] };
+  }
+
+  const nextPlan = Array.isArray(planItems) ? [...planItems] : [];
+  for (const day of selectedDays) {
+    for (const session of reminderSessions) {
+      const label = normalizeReminderLabel(session.label || "Reminder");
+      const alreadyExists = nextPlan.some((item) => {
+        const itemDay = String(item?.weekdayLabel ?? "");
+        const itemTarget = String(item?.targetType ?? "weekday");
+        const sameDay = itemTarget === "weekday" && itemDay === day;
+        const sameTime = normalizeGoalTimeValue(item?.startTime) === session.startTime;
+        const sameLabel = normalizeCoachTextForComparison(item?.title).includes(normalizeCoachTextForComparison(label));
+        return sameDay && sameTime && sameLabel;
+      });
+
+      if (alreadyExists) continue;
+
+      nextPlan.push({
+        id: `added-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${day}-${session.startTime.replace(":", "")}`,
+        title: label,
+        startTime: session.startTime,
+        endTime: session.endTime,
+        explanation: getReminderExplanation(label, session.startTime),
+        category: getReminderCategoryFromLabel(label),
+        imageKey: null,
+        imageUri: null,
+        imageSearchQuery: `${label} reminder routine`,
+        timeframeType: "day",
+        timeframeValue: 1,
+        targetType: "weekday",
+        difficultyLevel: "basic",
+        weekdayLabel: day,
+        plannedDate: "",
+        targetKey: day,
+        targetLabel: day,
+        phaseLabel: "Daily Routine",
+        resourceLinks: [],
+      });
+    }
+  }
+
+  return { plan: nextPlan, addedSessions: reminderSessions };
+};
+
 const autoAdjustPlanAgainstExistingSchedule = (
   rawPlan = [],
   existingSchedule = [],
@@ -5967,6 +6100,8 @@ const getMessageWordCount = (value = "") =>
 const isBriefAmbiguousReply = (value = "") => {
   const text = String(value ?? "").trim();
   if (!text) return false;
+  if (messageLooksLikeConcreteAnswer(text)) return false;
+  if (inferSingleSessionTimeFromText(text).length > 0) return false;
 
   return getMessageWordCount(text) <= 4 && !/[?]/.test(text);
 };
@@ -6000,6 +6135,59 @@ const getRecentSubstantiveUserEdit = (messages = [], latestText = "") => {
   }
 
   return String(latestText ?? "").trim();
+};
+
+const getRecentEditThreadInstruction = (messages = [], latestText = "") => {
+  const recentUserMessages = (Array.isArray(messages) ? messages : [])
+    .filter((item) => item?.role === "user")
+    .map((item) => String(item?.content ?? "").trim())
+    .filter(Boolean)
+    .slice(-5);
+
+  const latest = String(latestText ?? "").trim();
+  if (latest && !recentUserMessages.includes(latest)) {
+    recentUserMessages.push(latest);
+  }
+
+  const combined = recentUserMessages.join(". ");
+  const normalized = normalizeHumanReplyIntentText(combined);
+  const hasEditIntent =
+    /\b(add|include|create|put|insert|remove|delete|change|update|edit|move|reschedule|rename|lunch|breakfast|dinner|snack|workout|bed|sleep|wake|reminder|notification|alert)\b/.test(normalized);
+  const hasConcreteDetail =
+    messageLooksLikeConcreteAnswer(combined) ||
+    inferSingleSessionTimeFromText(combined).length > 0 ||
+    inferReminderEditSessionTimesFromText(combined).length > 0;
+
+  return hasEditIntent && hasConcreteDetail ? combined : "";
+};
+
+const buildContextualEditInstruction = ({
+  messages = [],
+  latestText = "",
+  fallbackEdit = "",
+} = {}) => {
+  const latest = String(latestText ?? "").trim();
+  const fallback = String(fallbackEdit ?? "").trim();
+  const lastAssistantQuestion = getLastAssistantQuestion(messages);
+  const questionText = normalizeCoachTextForComparison(lastAssistantQuestion);
+
+  if (
+    latest &&
+    fallback &&
+    latest !== fallback &&
+    (
+      messageLooksLikeConcreteAnswer(latest) ||
+      inferSingleSessionTimeFromText(latest).length > 0 ||
+      inferLabeledReminderSessionTimesFromText(`${fallback} ${latest}`).length > 0
+    )
+  ) {
+    if (/\b(lunch|breakfast|dinner|meal|snack|time|when)\b/.test(questionText)) {
+      return `${fallback}. The answer to the follow-up question is: ${latest}.`;
+    }
+    return `${fallback}. Extra detail: ${latest}.`;
+  }
+
+  return fallback || latest;
 };
 app.post("/edit-plan-coach-reply", checkCredits, async (req, res) => {
   try {
@@ -6141,6 +6329,15 @@ Reply as the coach. Do not generate a plan.`,
       messages,
       latestEditInstruction,
     );
+    const recentEditThreadInstruction = getRecentEditThreadInstruction(
+      messages,
+      latestEditInstruction,
+    );
+    const contextualPendingEdit = buildContextualEditInstruction({
+      messages,
+      latestText: latestEditInstruction,
+      fallbackEdit: recentEditThreadInstruction || fallbackPendingEdit,
+    });
     const parsedAction = String(parsed?.action ?? "reply_only").trim();
     const parsedReply = String(parsed?.reply ?? "").trim();
     const shouldClarifyAmbiguousReply =
@@ -6151,8 +6348,12 @@ Reply as the coach. Do not generate a plan.`,
       !Boolean(parsed?.canGeneratePlan);
 
     const action = shouldClarifyAmbiguousReply ? "reply_only" : parsedAction;
+    const parsedPendingEditInstruction = String(parsed?.pendingEditInstruction ?? "").trim();
     const pendingEditInstruction = String(
-      parsed?.pendingEditInstruction || fallbackPendingEdit || editInstruction,
+      contextualPendingEdit &&
+        (!parsedPendingEditInstruction || contextualPendingEdit.length > parsedPendingEditInstruction.length)
+        ? contextualPendingEdit
+        : parsedPendingEditInstruction || contextualPendingEdit || fallbackPendingEdit || editInstruction,
     ).trim();
     const reply = shouldClarifyAmbiguousReply
       ? "Do you mean I should update it, or keep it as it is?"
@@ -6605,7 +6806,14 @@ Modify the plan now.`
       });
     }
 
-const planWithIds = ensurePlanItemIds(editResult.plan);
+const reminderEditResult = applyReminderAddEditToPlan({
+  planItems: editResult.plan,
+  currentGoalMeta,
+  editInstruction,
+  conversationText,
+});
+
+const planWithIds = ensurePlanItemIds(reminderEditResult.plan);
 
 const imageProtectedPlan = restoreUnrequestedImageChanges({
   planItems: planWithIds,
@@ -6641,6 +6849,10 @@ res.json({
       goalMeta: {
       ...(currentGoalMeta ?? {}),
       ...(editResult.goalMeta ?? {}),
+      sessionTimes: mergeGoalSessionTimes(
+        editResult.goalMeta?.sessionTimes || currentGoalMeta?.sessionTimes,
+        reminderEditResult.addedSessions,
+      ),
       calendarExceptions: mergeCalendarExceptions(
         currentGoalMeta?.calendarExceptions,
         editResult.goalMeta?.calendarExceptions,
