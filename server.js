@@ -3425,8 +3425,27 @@ const narrowImageEditOperationsForReminderTarget = ({
   currentPlan = [],
   editInstruction = "",
 } = {}) => {
+  if (!Array.isArray(imageEditOperations) || imageEditOperations.length === 0) {
+    return imageEditOperations;
+  }
+
+  const exactShiftOperations = imageEditOperations.filter(
+    (operation) => operation.scope === "shift" && operation.shiftId,
+  );
+
+  if (exactShiftOperations.length > 0) {
+    return imageEditOperations.map((operation) =>
+      operation.scope === "shift" && operation.shiftId
+        ? {
+            ...operation,
+            applyToAllMatchingShifts: false,
+          }
+        : operation,
+    );
+  }
+
   const target = inferReminderImageTargetEdit(editInstruction);
-  if (!target || !Array.isArray(imageEditOperations) || imageEditOperations.length === 0) {
+  if (!target) {
     return imageEditOperations;
   }
 
