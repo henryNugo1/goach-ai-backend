@@ -2772,17 +2772,41 @@ const applyReminderAddEditToPlan = ({
   editInstruction = "",
   conversationText = "",
 } = {}) => {
-  const text = `${conversationText}\n${editInstruction}`;
+  const quotedOriginalEdit = String(editInstruction ?? "").match(
+    /Original requested edit:\s*"([^"]+)"/i,
+  )?.[1];
+  const quotedLatestMessage = String(editInstruction ?? "").match(
+    /Latest user message:\s*"([^"]+)"/i,
+  )?.[1];
+  const focusedEditText = [quotedOriginalEdit, quotedLatestMessage]
+    .filter(Boolean)
+    .join(". ")
+    .trim();
+  const reminderSearchText = focusedEditText || String(editInstruction ?? "");
+  const text = `${conversationText}\n${reminderSearchText}`;
   const normalized = normalizeCoachTextForComparison(text);
-  const wantsAdd =
-    /\b(add|include|create|put|insert|also|as well|new)\b/.test(normalized) &&
+  const hasReminderTarget =
     /\b(reminder|notification|alert|lunch|breakfast|dinner|snack|workout|exercise|bed|sleep|wake)\b/.test(normalized);
+  const hasRemovalIntent =
+    /\b(remove|delete|drop|cancel|skip|exclude)\b/.test(normalized);
+  const hasAddIntent =
+    /\b(add|include|create|put|insert|also|as well|new|want|need|set|save|track)\b/.test(normalized);
+  const hasConcreteReminderTime =
+    inferReminderEditSessionTimesFromText(reminderSearchText).length > 0 ||
+    inferReminderEditSessionTimesFromText(text).length > 0;
+  const wantsAdd =
+    hasReminderTarget &&
+    !hasRemovalIntent &&
+    (hasAddIntent || hasConcreteReminderTime);
 
   if (!wantsAdd) {
     return { plan: planItems, addedSessions: [] };
   }
 
-  const reminderSessions = inferReminderEditSessionTimesFromText(text);
+  const reminderSessions =
+    inferReminderEditSessionTimesFromText(reminderSearchText).length > 0
+      ? inferReminderEditSessionTimesFromText(reminderSearchText)
+      : inferReminderEditSessionTimesFromText(text);
   if (reminderSessions.length === 0) {
     return { plan: planItems, addedSessions: [] };
   }
@@ -6106,6 +6130,12 @@ const isBriefAmbiguousReply = (value = "") => {
   return getMessageWordCount(text) <= 4 && !/[?]/.test(text);
 };
 
+const cleanEditCompletionReply = (reply = "") => {
+  return String(reply ?? "")
+    .replace(/\s*(What else would you like to adjust\?|What would you like to adjust\?)\s*$/i, "")
+    .trim();
+};
+
 const getLastAssistantQuestion = (messages = []) => {
   if (!Array.isArray(messages)) return "";
 
@@ -6268,11 +6298,16 @@ ${buildSimpleCoachVoiceRules()}
 
 Major schedule changes include:
 - removing, deleting, skipping, excluding, or canceling a weekday, date, week, month, year, or scheduled shift
-- adding a weekday, date, week, month, year, or scheduled shift
 - changing a shift day, date, time, title, explanation, duration, target type, or frequency
 
+Additive schedule edits:
+- If the user wants to add or include a helpful reminder, meal, bedtime, wake time, workout, study session, or extra shift, treat it as goal-supportive or goal-neutral unless it clearly creates a conflict.
+- Do not ask why for a simple additive edit.
+- If the additive edit has enough details, acknowledge the detail and ask if there is anything else before updating, or generate the edit if the user has already confirmed.
+- If the additive edit is missing the time, day, or scope needed to save it, ask only for that missing detail.
+
 Reason rule:
-- If the latest user request is a major schedule change and the user has not given a reason, ask one short "why" question.
+- If the latest user request removes, deletes, skips, excludes, cancels, weakens, or reduces existing scheduled work and the user has not given a reason, ask one short "why" question.
 - In that case, set action="ask_reason", canGeneratePlan=false, and preserve the requested edit in pendingEditInstruction.
 - Do not show the generate button yet when asking why.
 
@@ -6866,7 +6901,7 @@ const conflictAdjustedPlan = autoAdjustPlanAgainstExistingSchedule(
     const remainingCredits = await deductCreditsAfterSuccess(req);
 
 res.json({
-  reply: editResult.reply || "Done. I updated your plan.",
+  reply: cleanEditCompletionReply(editResult.reply) || "Done. I updated your plan.",
   needsMoreInfo: false,
   goalMeta: normalizeGoalForm({
       goalMeta: {
