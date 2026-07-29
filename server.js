@@ -3401,6 +3401,55 @@ const normalizeImageEditOperations = (operations = []) => {
     .filter((operation) => operation.action === "change_image");
 };
 
+const inferReminderImageTargetEdit = (editInstruction = "") => {
+  const focusedText = getFocusedEditTextFromInstruction(editInstruction);
+  const normalized = normalizeCoachTextForComparison(focusedText);
+
+  if (!/\b(image|picture|photo|pic)\b/.test(normalized)) return null;
+
+  const labelChecks = [
+    { kind: "bedtime", label: "Bedtime", pattern: /\b(bed|bedtime|bed time|sleep time|sleeping time|sleeping|sleep)\b/ },
+    { kind: "wake", label: "Wake Up", pattern: /\b(wake|wake up|waking|get up)\b/ },
+    { kind: "lunch", label: "Lunch", pattern: /\b(lunch|midday meal)\b/ },
+    { kind: "breakfast", label: "Breakfast", pattern: /\b(breakfast|morning meal)\b/ },
+    { kind: "dinner", label: "Dinner", pattern: /\b(dinner|night meal|supper)\b/ },
+    { kind: "snack", label: "Snack", pattern: /\b(snack|snacks)\b/ },
+    { kind: "workout", label: "Workout", pattern: /\b(workout|exercise|gym|training|walk|run)\b/ },
+  ];
+
+  return labelChecks.find((item) => item.pattern.test(normalized)) || null;
+};
+
+const narrowImageEditOperationsForReminderTarget = ({
+  imageEditOperations = [],
+  currentPlan = [],
+  editInstruction = "",
+} = {}) => {
+  const target = inferReminderImageTargetEdit(editInstruction);
+  if (!target || !Array.isArray(imageEditOperations) || imageEditOperations.length === 0) {
+    return imageEditOperations;
+  }
+
+  const matchingItems = (Array.isArray(currentPlan) ? currentPlan : []).filter((item) =>
+    planItemMatchesReminderTimeEdit(item, target),
+  );
+
+  if (matchingItems.length === 0) return imageEditOperations;
+
+  return imageEditOperations.flatMap((operation) =>
+    matchingItems.map((item) => ({
+      ...operation,
+      scope: "shift",
+      shiftId: String(item.id ?? ""),
+      weekdayLabel: undefined,
+      plannedDate: undefined,
+      targetType: undefined,
+      targetKey: undefined,
+      applyToAllMatchingShifts: false,
+    })),
+  );
+};
+
 const normalizeAIEditResponse = (parsed) => {
   if (Array.isArray(parsed)) {
     return {
@@ -7009,17 +7058,23 @@ const reminderEditResult = applyReminderAddEditToPlan({
   conversationText,
 });
 
+const narrowedImageEditOperations = narrowImageEditOperationsForReminderTarget({
+  imageEditOperations: editResult.imageEditOperations,
+  currentPlan,
+  editInstruction,
+});
+
 const planWithIds = ensurePlanItemIds(reminderEditResult.plan);
 
 const imageProtectedPlan = restoreUnrequestedImageChanges({
   planItems: planWithIds,
   originalPlan: currentPlan,
-  imageEditOperations: editResult.imageEditOperations,
+  imageEditOperations: narrowedImageEditOperations,
 });
 
 const imageAdjustedPlan = await applyUnsplashImageEditOperations({
   planItems: imageProtectedPlan,
-  imageEditOperations: editResult.imageEditOperations,
+  imageEditOperations: narrowedImageEditOperations,
   goal,
   includeImages,
 });
