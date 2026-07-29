@@ -2766,22 +2766,151 @@ const mergeGoalSessionTimes = (existing = [], additions = []) => {
   return merged.slice(0, 8);
 };
 
+const getFocusedEditTextFromInstruction = (editInstruction = "") => {
+  const source = String(editInstruction ?? "");
+  const quotedOriginalEdit = source.match(/Original requested edit:\s*"([^"]+)"/i)?.[1];
+  const quotedLatestMessage = source.match(/Latest user message:\s*"([^"]+)"/i)?.[1];
+
+  return [quotedOriginalEdit, quotedLatestMessage]
+    .filter(Boolean)
+    .join(". ")
+    .trim() || source;
+};
+
+const inferReminderTimeChangeEdit = (editInstruction = "") => {
+  const focusedText = getFocusedEditTextFromInstruction(editInstruction);
+  const normalized = normalizeCoachTextForComparison(focusedText);
+  const hasChangeIntent =
+    /\b(change|move|reschedule|shift|adjust|set|make|turn|replace)\b/.test(normalized);
+
+  if (!hasChangeIntent) return null;
+
+  const labelChecks = [
+    { kind: "bedtime", label: "Bedtime", pattern: /\b(bed|bedtime|bed time|sleep|sleeping)\b/ },
+    { kind: "wake", label: "Wake Up", pattern: /\b(wake|wake up|waking|get up)\b/ },
+    { kind: "lunch", label: "Lunch", pattern: /\b(lunch|midday meal)\b/ },
+    { kind: "breakfast", label: "Breakfast", pattern: /\b(breakfast|morning meal)\b/ },
+    { kind: "dinner", label: "Dinner", pattern: /\b(dinner|night meal|supper)\b/ },
+    { kind: "snack", label: "Snack", pattern: /\b(snack|snacks)\b/ },
+    { kind: "workout", label: "Workout", pattern: /\b(workout|exercise|gym|training|walk|run)\b/ },
+  ];
+  const target = labelChecks.find((item) => item.pattern.test(normalized));
+  if (!target) return null;
+
+  const toMatches = [
+    ...focusedText.matchAll(/\b(?:to|at|by|for)\s+(\d{1,2})(?:[:\s]?(\d{2}))?\s*(am|pm)\b/gi),
+  ];
+  const allTimeMatches = [
+    ...focusedText.matchAll(/\b(\d{1,2})(?:[:\s]?(\d{2}))?\s*(am|pm)\b/gi),
+  ];
+  const selectedMatch =
+    toMatches.length > 0
+      ? toMatches[toMatches.length - 1]
+      : allTimeMatches[allTimeMatches.length - 1];
+
+  if (!selectedMatch) return null;
+
+  const rawHour = selectedMatch[1];
+  const rawMinute = selectedMatch[2] ?? "";
+  const rawMeridiem = selectedMatch[3];
+  const startTime = normalizeGoalTimeValue(`${rawHour}${rawMinute}${rawMeridiem}`);
+  if (!startTime) return null;
+
+  return {
+    kind: target.kind,
+    label: target.label,
+    startTime,
+  };
+};
+
+const planItemMatchesReminderTimeEdit = (item, edit) => {
+  if (!item || !edit) return false;
+
+  const text = normalizeCoachTextForComparison(
+    `${item.title ?? ""} ${item.explanation ?? ""} ${item.category ?? ""} ${item.phaseLabel ?? ""}`,
+  );
+  const startMinutes = parseTimeToMinutes(item.startTime);
+
+  if (edit.kind === "bedtime") {
+    return (
+      /\b(bed|bedtime|sleep|sleeping)\b/.test(text) ||
+      (/\bsleep\b/.test(text) && startMinutes >= 18 * 60)
+    ) && !/\b(wake|waking|get up)\b/.test(text);
+  }
+
+  if (edit.kind === "wake") {
+    return /\b(wake|waking|get up)\b/.test(text);
+  }
+
+  if (["lunch", "breakfast", "dinner", "snack"].includes(edit.kind)) {
+    return new RegExp(`\\b${edit.kind}\\b`).test(text);
+  }
+
+  if (edit.kind === "workout") {
+    return /\b(workout|exercise|gym|training|walk|run)\b/.test(text);
+  }
+
+  return false;
+};
+
+const applyReminderTimeChangeEditToPlan = ({
+  planItems = [],
+  currentPlan = [],
+  editInstruction = "",
+} = {}) => {
+  const edit = inferReminderTimeChangeEdit(editInstruction);
+  if (!edit) return { plan: planItems, changed: false, changedSessions: [] };
+
+  const sourcePlan = Array.isArray(currentPlan) && currentPlan.length > 0
+    ? currentPlan
+    : planItems;
+  let changed = false;
+  const changedSessions = [];
+
+  const nextPlan = sourcePlan.map((item) => {
+    if (!planItemMatchesReminderTimeEdit(item, edit)) return item;
+
+    const oldStart = normalizeGoalTimeValue(item.startTime);
+    const oldEnd = normalizeGoalTimeValue(item.endTime);
+    const oldDuration =
+      oldStart && oldEnd
+        ? Math.max(5, (parseTimeToMinutes(oldEnd) - parseTimeToMinutes(oldStart) + 24 * 60) % (24 * 60) || getReminderDurationMinutes(edit.label))
+        : getReminderDurationMinutes(edit.label);
+    const endTime = addMinutesToTime(edit.startTime, oldDuration);
+    changed = true;
+    changedSessions.push({
+      startTime: edit.startTime,
+      endTime,
+      label: edit.label,
+      purpose: edit.label,
+    });
+
+    return {
+      ...item,
+      startTime: edit.startTime,
+      endTime,
+      title: item.title || edit.label,
+      explanation:
+        item.explanation ||
+        getReminderExplanation(edit.label, edit.startTime),
+      category: item.category || getReminderCategoryFromLabel(edit.label),
+    };
+  });
+
+  return {
+    plan: changed ? nextPlan : planItems,
+    changed,
+    changedSessions,
+  };
+};
+
 const applyReminderAddEditToPlan = ({
   planItems = [],
   currentGoalMeta = null,
   editInstruction = "",
   conversationText = "",
 } = {}) => {
-  const quotedOriginalEdit = String(editInstruction ?? "").match(
-    /Original requested edit:\s*"([^"]+)"/i,
-  )?.[1];
-  const quotedLatestMessage = String(editInstruction ?? "").match(
-    /Latest user message:\s*"([^"]+)"/i,
-  )?.[1];
-  const focusedEditText = [quotedOriginalEdit, quotedLatestMessage]
-    .filter(Boolean)
-    .join(". ")
-    .trim();
+  const focusedEditText = getFocusedEditTextFromInstruction(editInstruction);
   const reminderSearchText = focusedEditText || String(editInstruction ?? "");
   const text = `${conversationText}\n${reminderSearchText}`;
   const normalized = normalizeCoachTextForComparison(text);
@@ -2791,12 +2920,15 @@ const applyReminderAddEditToPlan = ({
     /\b(remove|delete|drop|cancel|skip|exclude)\b/.test(normalized);
   const hasAddIntent =
     /\b(add|include|create|put|insert|also|as well|new|want|need|set|save|track)\b/.test(normalized);
+  const hasChangeIntent =
+    /\b(change|move|reschedule|shift|adjust|replace|turn)\b/.test(normalized);
   const hasConcreteReminderTime =
     inferReminderEditSessionTimesFromText(reminderSearchText).length > 0 ||
     inferReminderEditSessionTimesFromText(text).length > 0;
   const wantsAdd =
     hasReminderTarget &&
     !hasRemovalIntent &&
+    !hasChangeIntent &&
     (hasAddIntent || hasConcreteReminderTime);
 
   if (!wantsAdd) {
@@ -6864,8 +6996,14 @@ Modify the plan now.`
       });
     }
 
-const reminderEditResult = applyReminderAddEditToPlan({
+const reminderTimeChangeResult = applyReminderTimeChangeEditToPlan({
   planItems: editResult.plan,
+  currentPlan,
+  editInstruction,
+});
+
+const reminderEditResult = applyReminderAddEditToPlan({
+  planItems: reminderTimeChangeResult.plan,
   currentGoalMeta,
   editInstruction,
   conversationText,
@@ -6909,7 +7047,10 @@ res.json({
       ...(editResult.goalMeta ?? {}),
       sessionTimes: mergeGoalSessionTimes(
         editResult.goalMeta?.sessionTimes || currentGoalMeta?.sessionTimes,
-        reminderEditResult.addedSessions,
+        [
+          ...reminderTimeChangeResult.changedSessions,
+          ...reminderEditResult.addedSessions,
+        ],
       ),
       calendarExceptions: mergeCalendarExceptions(
         currentGoalMeta?.calendarExceptions,
