@@ -2269,6 +2269,161 @@ const buildGoalFinalSummaryReply = (goalDraft = {}) => {
   return `Here is the plan I am about to build: ${title}${detailText}. Does that look right?`;
 };
 
+const hasFoodSignal = (text = "") =>
+  /\b(food|meal|diet|eat|eating|breakfast|lunch|dinner|snack|portion|calorie)\b/.test(
+    normalizeCoachTextForComparison(text),
+  );
+
+const hasMovementSignal = (text = "") =>
+  /\b(workout|exercise|movement|walk|walking|gym|training|run|running|fitness)\b/.test(
+    normalizeCoachTextForComparison(text),
+  );
+
+const hasBodyGoalSignal = (text = "") =>
+  /\b(weight|lose weight|weight loss|fat|fitness|muscle|bulk|bulking|gain weight|physique|body)\b/.test(
+    normalizeCoachTextForComparison(text),
+  );
+
+const goalDraftNeedsFoodAndMovementCoverage = (
+  goalDraft = {},
+  conversationText = "",
+) => {
+  const goalParts = isPlainObject(goalDraft?.goalParts) ? goalDraft.goalParts : {};
+  const knownFacts = isPlainObject(goalDraft?.knownFacts) ? goalDraft.knownFacts : {};
+  const combinedText = [
+    getGoalDraftSearchText(goalDraft),
+    conversationText,
+    JSON.stringify(goalParts),
+    JSON.stringify(knownFacts),
+  ].join(" ");
+  const text = normalizeCoachTextForComparison(combinedText);
+
+  const agreedBoth =
+    /\bboth\b/.test(text) ||
+    (isMeaningfulStructuredValue(goalParts.food) &&
+      isMeaningfulStructuredValue(goalParts.workout));
+
+  return (
+    hasBodyGoalSignal(text) &&
+    agreedBoth &&
+    hasFoodSignal(text) &&
+    hasMovementSignal(text)
+  );
+};
+
+const sessionLooksLikeFood = (session = {}) =>
+  hasFoodSignal(
+    [
+      session?.label,
+      session?.purpose,
+      session?.title,
+      session?.category,
+    ].join(" "),
+  );
+
+const planItemLooksLikeFood = (item = {}) =>
+  String(item?.category ?? "").toLowerCase() === "cooking" ||
+  hasFoodSignal(
+    [
+      item?.title,
+      item?.explanation,
+      item?.imageSearchQuery,
+      item?.phaseLabel,
+    ].join(" "),
+  );
+
+const planItemLooksLikeMovement = (item = {}) =>
+  String(item?.category ?? "").toLowerCase() === "workout" ||
+  hasMovementSignal(
+    [
+      item?.title,
+      item?.explanation,
+      item?.imageSearchQuery,
+      item?.phaseLabel,
+    ].join(" "),
+  );
+
+const hasFoodSessionTime = (goalDraft = {}) =>
+  normalizeGoalSessionTimes(goalDraft?.sessionTimes, goalDraft?.sessionTime).some(
+    sessionLooksLikeFood,
+  );
+
+const buildMissingRequiredPartReply = (goalDraft = {}, conversationText = "") => {
+  if (
+    goalDraftNeedsFoodAndMovementCoverage(goalDraft, conversationText) &&
+    !hasFoodSessionTime(goalDraft)
+  ) {
+    return "I have the workout part. Since you chose both food and workout, what time should I use for the food part? You can send breakfast, lunch, and dinner times, or one daily food check-in time.";
+  }
+
+  return "";
+};
+
+const requiredGoalPartsCovered = (goalDraft = {}, conversationText = "") => {
+  if (!goalDraftNeedsFoodAndMovementCoverage(goalDraft, conversationText)) {
+    return true;
+  }
+
+  return hasFoodSessionTime(goalDraft);
+};
+
+const buildFoodSupportShift = (session = {}, day = "Mon") => {
+  const label = normalizeReminderLabel(session.label || session.purpose || "Food Check-In");
+  const targetLabel = String(day ?? "").trim() || "Daily";
+
+  return {
+    title: label,
+    startTime: session.startTime,
+    endTime: session.endTime,
+    explanation: `${label} starts at ${formatGoalTimeForUser(session.startTime)}. Eat calmly, keep the meal balanced with protein, carbs, and fruit or vegetables, then mark it done. This keeps the food part of the plan active, not forgotten.`,
+    category: "cooking",
+    imageSearchQuery: "healthy balanced meal routine",
+    timeframeType: "day",
+    timeframeValue: 1,
+    targetType: "weekday",
+    difficultyLevel: "basic",
+    weekdayLabel: day,
+    plannedDate: "",
+    targetKey: targetLabel,
+    targetLabel,
+    phaseLabel: "Food Support",
+    resourceLinks: [],
+  };
+};
+
+const ensurePlanCoversRequiredParts = ({
+  planItems = [],
+  goalMeta = null,
+  conversationText = "",
+}) => {
+  if (!goalDraftNeedsFoodAndMovementCoverage(goalMeta, conversationText)) {
+    return planItems;
+  }
+
+  const hasFood = planItems.some(planItemLooksLikeFood);
+  const hasMovement = planItems.some(planItemLooksLikeMovement);
+  if (hasFood || !hasMovement) return planItems;
+
+  const foodSessions = normalizeGoalSessionTimes(
+    goalMeta?.sessionTimes,
+    goalMeta?.sessionTime,
+  ).filter(sessionLooksLikeFood);
+
+  if (foodSessions.length === 0) return planItems;
+
+  const selectedDays = normalizeGoalSelectedDays(goalMeta?.selectedDays);
+  if (selectedDays.length === 0) return planItems;
+
+  const additions = [];
+  for (const day of selectedDays) {
+    for (const session of foodSessions) {
+      additions.push(buildFoodSupportShift(session, day));
+    }
+  }
+
+  return removeDuplicatePreferredSessionShifts([...planItems, ...additions]);
+};
+
 const hasStructuredGoalParts = (goalDraft = {}) => {
   const goalParts = isPlainObject(goalDraft?.goalParts) ? goalDraft.goalParts : {};
   const knownFacts = isPlainObject(goalDraft?.knownFacts) ? goalDraft.knownFacts : {};
@@ -5468,6 +5623,7 @@ Generate the next Goach reply now.`,
       selectedDaysComplete: hasDays,
       routineModeComplete: hasRoutineMode,
       sessionTimesComplete: hasSessionTime,
+      requiredPartsComplete: requiredGoalPartsCovered(goalDraft, conversationText),
       goalStartDateComplete: hasStartDate,
       breaksResolved: Boolean(isOneTimeGoal || goalDraft.breaksResolved || goalDraft.breakDays.length > 0 || goalDraft.selectedDays.length > 0),
       levelResolved: Boolean(isOneTimeGoal || goalDraft.levelResolved || goalDraft.level || !goalDraft.levelNeeded),
@@ -5544,6 +5700,9 @@ Generate the next Goach reply now.`,
       }
       if (!checklist.sessionTimesComplete) {
         return pickCoachQuestion("time");
+      }
+      if (!checklist.requiredPartsComplete) {
+        return buildMissingRequiredPartReply(goalDraft, conversationText) || pickCoachQuestion("time");
       }
       if (!checklist.goalStartDateComplete) {
         return buildGoalStartDateReply(goalDraft, now);
@@ -6245,8 +6404,14 @@ Build a realistic long-term roadmap in your reasoning, but output only the next 
       currentGoalMeta,
     );
 
+    const requiredPartsPlan = ensurePlanCoversRequiredParts({
+      planItems: preferredTimePlan,
+      goalMeta: currentGoalMeta,
+      conversationText,
+    });
+
     const deduplicatedPlan =
-      removeDuplicatePreferredSessionShifts(preferredTimePlan);
+      removeDuplicatePreferredSessionShifts(requiredPartsPlan);
 
     const conflictAdjustedPlan = autoAdjustPlanAgainstExistingSchedule(
       deduplicatedPlan,
@@ -6505,6 +6670,8 @@ Additive schedule edits:
 - Do not ask why for a simple additive edit.
 - If the additive edit has enough details, acknowledge the detail and ask if there is anything else before updating, or generate the edit if the user has already confirmed.
 - If the additive edit is missing the time, day, or scope needed to save it, ask only for that missing detail.
+- If the user wants to add the missing food or meal part to a plan, do not invent a time. Ask for meal times or one food check-in time unless the conversation already contains that time.
+- If the original plan had workout plus food agreed, treat food as a required missing part, not as a random extra shift.
 
 Reason rule:
 - If the latest user request removes, deletes, skips, excludes, cancels, weakens, or reduces existing scheduled work and the user has not given a reason, ask one short "why" question.
@@ -6739,6 +6906,8 @@ Very important:
 - If you add a new shift, include all required shift fields
 - If you delete a shift, remove it from plan
 - Do not change unrelated fields. If the user asks for a time edit, keep images, titles, explanations, dates, and days unchanged unless the user clearly asks to change them.
+- If the user asks to add a missing food or meal part and no food time is known, return needsMoreInfo=true and ask for the meal time or one food check-in time. Do not choose a random time.
+- If the user already gave food times, add food shifts at those exact times and keep unrelated workout shifts unchanged.
 
 Image edit rules:
 - Understand image-change requests from the full conversation.
@@ -7098,8 +7267,26 @@ const imageAdjustedPlan = await applyUnsplashImageEditOperations({
   includeImages,
 });
 
+const goalMetaWithEditSessions = {
+  ...(currentGoalMeta ?? {}),
+  ...(editResult.goalMeta ?? {}),
+  sessionTimes: mergeGoalSessionTimes(
+    editResult.goalMeta?.sessionTimes || currentGoalMeta?.sessionTimes,
+    [
+      ...reminderTimeChangeResult.changedSessions,
+      ...reminderEditResult.addedSessions,
+    ],
+  ),
+};
+
+const requiredPartsAdjustedPlan = ensurePlanCoversRequiredParts({
+  planItems: imageAdjustedPlan,
+  goalMeta: goalMetaWithEditSessions,
+  conversationText: `${conversationText}\n${String(editInstruction ?? "")}`,
+});
+
 const conflictAdjustedPlan = autoAdjustPlanAgainstExistingSchedule(
-  imageAdjustedPlan,
+  requiredPartsAdjustedPlan,
   existingSchedule,
 );
 
@@ -7117,15 +7304,7 @@ res.json({
   needsMoreInfo: false,
   goalMeta: normalizeGoalForm({
       goalMeta: {
-      ...(currentGoalMeta ?? {}),
-      ...(editResult.goalMeta ?? {}),
-      sessionTimes: mergeGoalSessionTimes(
-        editResult.goalMeta?.sessionTimes || currentGoalMeta?.sessionTimes,
-        [
-          ...reminderTimeChangeResult.changedSessions,
-          ...reminderEditResult.addedSessions,
-        ],
-      ),
+      ...goalMetaWithEditSessions,
       calendarExceptions: mergeCalendarExceptions(
         currentGoalMeta?.calendarExceptions,
         editResult.goalMeta?.calendarExceptions,
