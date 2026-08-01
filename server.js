@@ -254,12 +254,19 @@ const getReminderDurationMinutes = (label = "") => {
   if (/\b(wake|wake up|waking|get up)\b/.test(text)) return 15;
   if (/\b(bed|bedtime|bed time|sleep|sleeping)\b/.test(text)) return 30;
   if (/\b(lunch|breakfast|dinner|meal|food|snack)\b/.test(text)) return 45;
-  if (/\b(workout|exercise|gym|training|walk|run)\b/.test(text)) return 60;
+  if (/\b(workout|work out|exercise|gym|training|walk|run)\b/.test(text)) return 60;
   return 15;
 };
 
 const normalizeReminderLabel = (label = "") => {
-  const cleaned = String(label ?? "")
+  const normalizedSource = String(label ?? "")
+    .replace(/\bwork\s+outs?\b/gi, "workout")
+    .replace(/\blunch\s+br\b/gi, "lunch")
+    .replace(/\blunch\s+by\b/gi, "lunch")
+    .replace(/\bbreakfast\s+by\b/gi, "breakfast")
+    .replace(/\bdinner\s+by\b/gi, "dinner");
+
+  const cleaned = normalizedSource
     .replace(/[_:;,.]+/g, " ")
     .replace(/\b(time|alert|notification|reminder|by|at|for)\b/gi, " ")
     .replace(/\s+/g, " ")
@@ -1900,7 +1907,7 @@ const buildFoodGuideProgressReply = ({ conversationText = "", latestUserMessage 
   const hasLength = /\b(1 month|one month|month|4 weeks|four weeks|week|7 day|7 days|full week|whole week)\b/.test(text);
   const hasFoodStyle = /\b(nigerian|local|general|common foods|foods i already eat|fresh plan)\b/.test(text);
   const hasAim = /\b(healthy|health|weight gain|gain weight|weight loss|lose weight|muscle|balanced)\b/.test(text);
-  const hasLooseChoice = /\b(loose|strict|simple|flexible|easy style|easy to follow)\b/.test(text);
+  const hasLooseChoice = /\b(loose|strict|simple|flexible|exact meals|specific meals|meal rules|easy style|easy to follow)\b/.test(text);
   const hasMeals = /\b(3 meals|three meals|morning afternoon night|breakfast lunch dinner|snack|snacks|small snacks)\b/.test(text);
 
   if (hasFoodGuideAlreadyBeenShown(previousAssistantReply, conversationText) && classifyConfirmationReply(latestUserMessage) === "accept") {
@@ -1917,7 +1924,7 @@ const buildFoodGuideProgressReply = ({ conversationText = "", latestUserMessage 
     return "Good. Is this mainly for staying healthy, weight gain, or weight loss?";
   }
   if (!hasLooseChoice) {
-    return "Good. Should it be a loose guide you can follow, or a strict meal list?";
+    return "Good. Do you want exact meals, like oats and eggs, or flexible meal rules, like protein plus carbs plus fruit or vegetables?";
   }
   if (!hasMeals) {
     return "Good. Should I include only 3 meals, or 3 meals plus small snacks?";
@@ -2275,7 +2282,7 @@ const hasFoodSignal = (text = "") =>
   );
 
 const hasMovementSignal = (text = "") =>
-  /\b(workout|exercise|movement|walk|walking|gym|training|run|running|fitness)\b/.test(
+  /\b(workout|work out|exercise|movement|walk|walking|gym|training|run|running|fitness)\b/.test(
     normalizeCoachTextForComparison(text),
   );
 
@@ -2348,12 +2355,39 @@ const hasFoodSessionTime = (goalDraft = {}) =>
     sessionLooksLikeFood,
   );
 
+const sessionLooksLikeMovement = (session = {}) =>
+  hasMovementSignal(
+    [
+      session?.label,
+      session?.purpose,
+      session?.title,
+      session?.category,
+    ].join(" "),
+  );
+
+const hasMovementSessionTime = (goalDraft = {}) =>
+  normalizeGoalSessionTimes(goalDraft?.sessionTimes, goalDraft?.sessionTime).some(
+    sessionLooksLikeMovement,
+  );
+
 const buildMissingRequiredPartReply = (goalDraft = {}, conversationText = "") => {
-  if (
-    goalDraftNeedsFoodAndMovementCoverage(goalDraft, conversationText) &&
-    !hasFoodSessionTime(goalDraft)
-  ) {
+  if (!goalDraftNeedsFoodAndMovementCoverage(goalDraft, conversationText)) {
+    return "";
+  }
+
+  const hasFoodTime = hasFoodSessionTime(goalDraft);
+  const hasMovementTime = hasMovementSessionTime(goalDraft);
+
+  if (!hasFoodTime && !hasMovementTime) {
+    return "Since you chose both food and workout, send the workout time and your meal times. For example: workout 8am, breakfast 9am, lunch 2pm, dinner 8:30pm.";
+  }
+
+  if (!hasFoodTime) {
     return "I have the workout part. Since you chose both food and workout, what time should I use for the food part? You can send breakfast, lunch, and dinner times, or one daily food check-in time.";
+  }
+
+  if (!hasMovementTime) {
+    return "I have the food part. Since you chose both food and workout, what time should I use for the workout part?";
   }
 
   return "";
@@ -2364,18 +2398,59 @@ const requiredGoalPartsCovered = (goalDraft = {}, conversationText = "") => {
     return true;
   }
 
-  return hasFoodSessionTime(goalDraft);
+  return hasFoodSessionTime(goalDraft) && hasMovementSessionTime(goalDraft);
 };
 
-const buildFoodSupportShift = (session = {}, day = "Mon") => {
+const getFoodStyleFromText = (text = "") => {
+  const normalized = normalizeCoachTextForComparison(text);
+  if (/\b(nigerian|local)\b/.test(normalized)) return "nigerian";
+  if (/\b(general|common|normal foods|not nigerian)\b/.test(normalized)) return "general";
+  return "general";
+};
+
+const getFoodShiftSuggestion = (label = "", style = "general") => {
+  const text = normalizeCoachTextForComparison(label);
+  const isNigerian = style === "nigerian";
+
+  if (/\bbreakfast\b/.test(text)) {
+    return isNigerian
+      ? "Eat oats or pap with boiled egg, or bread with egg and fruit. Keep sugar low and drink water before eating."
+      : "Eat oats with banana and egg, Greek yoghurt with fruit, or whole-grain bread with eggs. Keep it filling, not heavy.";
+  }
+
+  if (/\blunch\b/.test(text)) {
+    return isNigerian
+      ? "Eat rice with fish or chicken and vegetables, beans with small plantain, or moi-moi with fruit. Keep the plate normal, not heaped."
+      : "Eat rice, potatoes, or pasta with chicken, fish, eggs, or beans plus vegetables. Keep the carb portion moderate.";
+  }
+
+  if (/\bdinner\b/.test(text)) {
+    return isNigerian
+      ? "Eat fish, egg, beans, or chicken with vegetables and a small carb like yam, rice, or swallow. Keep dinner lighter than lunch."
+      : "Eat fish, chicken, eggs, beans, or tofu with vegetables and a small carb. Keep it lighter so weight loss stays easier.";
+  }
+
+  if (/\bsnack\b/.test(text)) {
+    return isNigerian
+      ? "Choose fruit, groundnut, yoghurt, boiled egg, or a small handful of nuts. Avoid sugary drinks and heavy snacks."
+      : "Choose fruit, yoghurt, nuts, boiled egg, or peanut butter toast. Keep the snack small and avoid sugary drinks.";
+  }
+
+  return isNigerian
+    ? "Use Nigerian foods in a balanced way: protein, a moderate carb, and vegetables or fruit. Keep portions controlled."
+    : "Use a balanced plate: protein, a moderate carb, and vegetables or fruit. Keep portions controlled and drink water.";
+};
+
+const buildFoodSupportShift = (session = {}, day = "Mon", style = "general") => {
   const label = normalizeReminderLabel(session.label || session.purpose || "Food Check-In");
   const targetLabel = String(day ?? "").trim() || "Daily";
+  const foodSuggestion = getFoodShiftSuggestion(label, style);
 
   return {
     title: label,
     startTime: session.startTime,
     endTime: session.endTime,
-    explanation: `${label} starts at ${formatGoalTimeForUser(session.startTime)}. Eat calmly, keep the meal balanced with protein, carbs, and fruit or vegetables, then mark it done. This keeps the food part of the plan active, not forgotten.`,
+    explanation: `${label} starts at ${formatGoalTimeForUser(session.startTime)}. ${foodSuggestion} Eat calmly, then mark it done. This keeps the food part of the plan active, not forgotten.`,
     category: "cooking",
     imageSearchQuery: "healthy balanced meal routine",
     timeframeType: "day",
@@ -2391,6 +2466,36 @@ const buildFoodSupportShift = (session = {}, day = "Mon") => {
   };
 };
 
+const buildWorkoutSupportShift = (session = {}, day = "Mon") => {
+  const label = normalizeReminderLabel(session.label || session.purpose || "Workout");
+  const targetLabel = String(day ?? "").trim() || "Daily";
+
+  return {
+    title: label,
+    startTime: session.startTime,
+    endTime: session.endTime,
+    explanation: `${label} starts at ${formatGoalTimeForUser(session.startTime)}. Warm up for 5 minutes with marching or light jogging. Do 3 rounds: 15 squats, 10 push-ups or knee push-ups, 20 jumping jacks, and a 30-second plank. Rest 45 seconds between rounds, then stretch for 3 minutes. This gives the movement part of the plan a clear action.`,
+    category: "workout",
+    imageSearchQuery: "beginner weight loss home workout",
+    timeframeType: "day",
+    timeframeValue: 1,
+    targetType: "weekday",
+    difficultyLevel: "basic",
+    weekdayLabel: day,
+    plannedDate: "",
+    targetKey: targetLabel,
+    targetLabel,
+    phaseLabel: "Movement",
+    resourceLinks: [
+      {
+        title: "Home workout form",
+        query: "beginner home workout squats push ups plank proper form",
+        type: "video",
+      },
+    ],
+  };
+};
+
 const ensurePlanCoversRequiredParts = ({
   planItems = [],
   goalMeta = null,
@@ -2402,22 +2507,36 @@ const ensurePlanCoversRequiredParts = ({
 
   const hasFood = planItems.some(planItemLooksLikeFood);
   const hasMovement = planItems.some(planItemLooksLikeMovement);
-  if (hasFood || !hasMovement) return planItems;
 
   const foodSessions = normalizeGoalSessionTimes(
     goalMeta?.sessionTimes,
     goalMeta?.sessionTime,
   ).filter(sessionLooksLikeFood);
+  const movementSessions = normalizeGoalSessionTimes(
+    goalMeta?.sessionTimes,
+    goalMeta?.sessionTime,
+  ).filter(sessionLooksLikeMovement);
 
-  if (foodSessions.length === 0) return planItems;
+  if ((hasFood || foodSessions.length === 0) && (hasMovement || movementSessions.length === 0)) {
+    return planItems;
+  }
 
   const selectedDays = normalizeGoalSelectedDays(goalMeta?.selectedDays);
   if (selectedDays.length === 0) return planItems;
 
+  const foodStyle = getFoodStyleFromText(`${conversationText} ${getGoalDraftSearchText(goalMeta)}`);
   const additions = [];
   for (const day of selectedDays) {
-    for (const session of foodSessions) {
-      additions.push(buildFoodSupportShift(session, day));
+    if (!hasFood) {
+      for (const session of foodSessions) {
+        additions.push(buildFoodSupportShift(session, day, foodStyle));
+      }
+    }
+
+    if (!hasMovement) {
+      for (const session of movementSessions) {
+        additions.push(buildWorkoutSupportShift(session, day));
+      }
     }
   }
 
@@ -2823,7 +2942,14 @@ const buildReminderPlanFromGoalMeta = (currentGoalMeta = null) => {
     currentGoalMeta?.sessionTime,
   );
   const searchText = getGoalDraftSearchText(currentGoalMeta);
+  const planningType = normalizeGoalPlanningType(currentGoalMeta?.goalPlanningType);
+  const responseMode = normalizeResponseMode(currentGoalMeta?.responseMode);
+  const hasCoachingPlanShape =
+    planningType === "outcome" ||
+    responseMode === "quick_build" ||
+    goalDraftNeedsFoodAndMovementCoverage(currentGoalMeta, searchText);
   const hasReminderShape =
+    !hasCoachingPlanShape &&
     sessionTimes.length > 1 &&
     (
       /\b(reminder|reminders|notification|notifications|alert|alerts)\b/.test(searchText) ||
@@ -5133,8 +5259,10 @@ Goal-card rules:
 - If the user wants Goach to create/build/add/save/lock the plan, use goal_planning or quick_build mode.
 - If a user asks for a plan guide, full plan, quick plan, routine, or steps they can follow, build toward a goal card automatically. Do not keep asking whether to turn it into a guide.
 - If the plan has multiple parts, cover all important parts inside the goal card plan. Example: a weight-loss plan with meals and walking must include both meals and walking.
-- For food routine or meal-plan intent, after the user agrees to continue, do not explain balanced meals again. Ask the next missing goal-card detail instead: one day/one week/one month, Nigerian foods or general foods, meal times or loose guide, simple or strict, then schedule details if needed.
-- If the user already gave length, food style, aim, loose/strict choice, and meals/snacks, move to the missing app detail such as time/start date, or show the final summary if complete. Do not keep saying "I can".
+- For food routine or meal-plan intent, after the user agrees to continue, do not explain balanced meals again. Ask the next missing goal-card detail instead.
+- Smart food flow: understand aim first: weight loss, weight gain, muscle gain, or general health. Then ask whether they want exact meals or flexible meal rules. Then ask culture/preference such as Nigerian foods, general foods, cheap foods, or restrictions. Then ask meal times if it becomes a goal card.
+- If the user wants exact meals, the final plan must name foods for each meal shift. If the user wants flexible meal rules, the final plan must give a clear formula with examples for each meal shift.
+- If the user already gave length, food style, aim, exact/flexible choice, meals/snacks, and meal times, move to start date or final summary if complete. Do not keep saying "I can".
 - "Full week" means all 7 days. Do not ask one day/week/month again.
 - For balanced diet advice, explain the balanced plate only once unless the user asks again. After that, move to the next clear question.
 - For body, fitness, food, energy, or health-related goals, reason from the user's actual intent before asking schedule questions.
@@ -5698,11 +5826,11 @@ Generate the next Goach reply now.`,
       if (!checklist.routineModeComplete) {
         return pickCoachQuestion("routineMode");
       }
-      if (!checklist.sessionTimesComplete) {
-        return pickCoachQuestion("time");
-      }
       if (!checklist.requiredPartsComplete) {
         return buildMissingRequiredPartReply(goalDraft, conversationText) || pickCoachQuestion("time");
+      }
+      if (!checklist.sessionTimesComplete) {
+        return pickCoachQuestion("time");
       }
       if (!checklist.goalStartDateComplete) {
         return buildGoalStartDateReply(goalDraft, now);
@@ -5732,6 +5860,19 @@ Generate the next Goach reply now.`,
 
     if (shouldOfferPlanGuide && reply.includes("?") && !/\b(advice|plan guide|simple advice|actions you can follow)\b/i.test(reply)) {
       reply = buildMissingReadyDetailReply();
+    }
+
+    if (
+      goalDraftNeedsFoodAndMovementCoverage(goalDraft, conversationText) &&
+      !requiredGoalPartsCovered(goalDraft, conversationText) &&
+      (
+        !reply.includes("?") ||
+        /\b(sample week|food guide|meal guide|what about|adjust it for|cheaper foods|weight gain|weight loss)\b/i.test(reply)
+      )
+    ) {
+      reply = buildMissingRequiredPartReply(goalDraft, conversationText) || buildMissingReadyDetailReply();
+      goalDraft.finalSummaryOffered = false;
+      goalDraft.finalSummaryConfirmed = false;
     }
 
     if (userAdjustedPendingSessionDuration && /\b(do you mean yes or no|does that work|is that okay|should i|what time)\b/i.test(reply)) {
@@ -6103,6 +6244,11 @@ Rules:
 - Do not create duplicate shifts for the same weekday and session window.
 - If the user requested exactly one session window, create only one recurring shift per selected weekday.
 - Do not invent an additional session unless the user explicitly requested multiple sessions.
+- If the user chose multiple plan parts, such as food + workout, each agreed part must appear in the plan as useful coaching content.
+- For food + workout plans, do not return only workout shifts or only meal reminders. Include meal guidance and workout actions.
+- If currentGoalMeta.sessionTimes contains labels like Breakfast, Lunch, Dinner, Snack, Workout, Walking, or Food Check-In, use those labels to create matching shifts at those exact times.
+- Do not treat meal times as plain reminders when the goal is weight loss, weight gain, health, fitness, or body change. They are coaching shifts and must include what to eat or how to choose food.
+- Do not use reminder-style wording like "Pause, do the reminder action" for coaching plans. That wording is only for pure reminders.
 - Recurring weekday shifts are schedule templates and must preserve the user's confirmed session time.
 - If today's confirmed session time has already passed, keep the time unchanged and let the first occurrence happen on the next matching day.
 - Never move a confirmed morning session into the evening or night just to make it later than the current time.
@@ -6233,6 +6379,20 @@ For workout shifts:
 - Include form cues
 - Include rest time
 - Keep it safe and beginner-friendly
+- For weight-loss workout shifts, include simple movement such as brisk walking, marching, squats, step-ups, push-ups, jumping jacks, or plank depending on the user level.
+- If the user gave only a workout start time and accepted Goach's suggested duration, use a realistic workout window, usually 30 to 60 minutes. Do not turn a workout into a 15-minute reminder unless the user asked for 15 minutes.
+For food and meal shifts:
+- Meal shifts must tell the user what to eat or how to build the meal.
+- If the user wants exact meals, name exact foods.
+- If the user wants flexible meals, give a simple formula such as protein + carb + vegetables or fruit, with examples.
+- Respect the food style the user chose. If the user chose general foods, do not default to Nigerian foods. If the user chose Nigerian foods, use Nigerian meals.
+- For weight loss, keep meals lighter and practical. Mention portion control simply, like "normal plate, not heaped".
+- Breakfast, lunch, dinner, and snacks should not all have the same explanation.
+- Good general breakfast examples: oats with banana and egg, Greek yoghurt with fruit, whole-grain bread with eggs.
+- Good general lunch examples: rice or potatoes with chicken/fish/beans and vegetables, salad with protein and a small carb.
+- Good general dinner examples: fish/chicken/beans with vegetables and a small carb, soup with protein.
+- Good Nigerian examples: beans and plantain, rice with fish and vegetables, moi-moi with fruit, yam and egg sauce, swallow with vegetable soup.
+- If calories are requested, explain that a useful calorie target needs height, weight, age, sex, and activity level. Do not invent precise calories without those details.
 For illness/recovery support shifts:
 - Do not use intense workout language
 - Keep actions gentle and supportive
@@ -6908,6 +7068,9 @@ Very important:
 - Do not change unrelated fields. If the user asks for a time edit, keep images, titles, explanations, dates, and days unchanged unless the user clearly asks to change them.
 - If the user asks to add a missing food or meal part and no food time is known, return needsMoreInfo=true and ask for the meal time or one food check-in time. Do not choose a random time.
 - If the user already gave food times, add food shifts at those exact times and keep unrelated workout shifts unchanged.
+- Added meal shifts must say what to eat or how to choose food. Do not write only "eat calmly" or "do the reminder action".
+- Added workout shifts must include exact actions such as warm-up, exercises, sets, reps, rest, and stretch. Do not write reminder-style instructions for workout plans.
+- Respect food style from the conversation. If the user chose general foods, use general foods. If the user chose Nigerian foods, use Nigerian foods.
 
 Image edit rules:
 - Understand image-change requests from the full conversation.
