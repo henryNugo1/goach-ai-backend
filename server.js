@@ -174,6 +174,7 @@ const normalizeGoalSessionTimes = (
       startTime: normalizeGoalTimeValue(item?.startTime),
       endTime: normalizeGoalTimeValue(item?.endTime),
       label: String(item?.label ?? item?.purpose ?? item?.title ?? "").trim(),
+      selectedDays: normalizeGoalSelectedDays(item?.selectedDays),
     }))
     .filter(
       (item) =>
@@ -1788,7 +1789,7 @@ const inferSelectedDaysFromText = (message = "") => {
   if (!text) return [];
 
   const rangeSeparators = "(?:-|to|till|until|through|thru|;|:)";
-  if (new RegExp(`\\b(every day|daily|all days|mon(?:day)?\\s*${rangeSeparators}\\s*sun(?:day)?)\\b`).test(text)) {
+  if (new RegExp(`\\b(every day|everyday|daily|all days|mon(?:day)?\\s*${rangeSeparators}\\s*sun(?:day)?)\\b`).test(text)) {
     return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   }
   if (new RegExp(`\\b(weekdays|mon(?:day)?\\s*${rangeSeparators}\\s*fri(?:day)?)\\b`).test(text)) {
@@ -1798,8 +1799,40 @@ const inferSelectedDaysFromText = (message = "") => {
     return ["Sat", "Sun"];
   }
 
+  const dayAliasToIndex = {
+    mon: 0,
+    monday: 0,
+    tue: 1,
+    tues: 1,
+    tuesday: 1,
+    wed: 2,
+    wednesday: 2,
+    thu: 3,
+    thur: 3,
+    thurs: 3,
+    thursday: 3,
+    fri: 4,
+    friday: 4,
+    sat: 5,
+    saturday: 5,
+    sun: 6,
+    sunday: 6,
+  };
+  const genericRangeMatch = text.match(
+    new RegExp(`\\b(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\\s*${rangeSeparators}\\s*(mon|monday|tue|tues|tuesday|wed|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\\b`),
+  );
+  if (genericRangeMatch) {
+    const startIndex = dayAliasToIndex[genericRangeMatch[1]];
+    const endIndex = dayAliasToIndex[genericRangeMatch[2]];
+    if (Number.isInteger(startIndex) && Number.isInteger(endIndex)) {
+      if (startIndex <= endIndex) return weekDays.slice(startIndex, endIndex + 1);
+      return [...weekDays.slice(startIndex), ...weekDays.slice(0, endIndex + 1)];
+    }
+  }
+
   const compactText = text.replace(/\s+/g, "");
   if (/\bmonfri\b/.test(compactText)) return ["Mon", "Tue", "Wed", "Thu", "Fri"];
+  if (/\bmonsat\b/.test(compactText)) return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   if (/\bsatsun\b/.test(compactText)) return ["Sat", "Sun"];
 
   const dayMap = [
@@ -1813,6 +1846,83 @@ const inferSelectedDaysFromText = (message = "") => {
   ];
 
   return dayMap.filter(([, pattern]) => pattern.test(text)).map(([day]) => day);
+};
+
+const inferPartDayScopesFromText = (message = "") => {
+  const rawText = normalizeHumanReplyIntentText(message);
+  if (!rawText) return {};
+
+  const scopes = {};
+  const separators = "(?:,|;|\\band\\b|\\n)";
+  const parts = rawText
+    .split(new RegExp(separators, "i"))
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  const readDaysFromPart = (part = "") => {
+    const selected = inferSelectedDaysFromText(part);
+    if (selected.length > 0) return selected;
+    if (/\b(full week|whole week|all week)\b/.test(part)) {
+      return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    }
+    return [];
+  };
+
+  const applyScope = (part = "") => {
+    const days = readDaysFromPart(part);
+    if (days.length === 0) return;
+
+    if (hasMovementSignal(part)) {
+      scopes.workout = days;
+    }
+
+    if (hasFoodSignal(part) || /\b(food plan|meal plan|meals)\b/.test(part)) {
+      scopes.food = days;
+    }
+  };
+
+  parts.forEach(applyScope);
+  if (!scopes.workout && !scopes.food) {
+    applyScope(rawText);
+  }
+
+  return scopes;
+};
+
+const applyPartDayScopesToSessions = (sessionTimes = [], scopes = {}) => {
+  const normalizedSessions = normalizeGoalSessionTimes(sessionTimes);
+  const workoutDays = normalizeGoalSelectedDays(scopes.workout);
+  const foodDays = normalizeGoalSelectedDays(scopes.food);
+
+  if (workoutDays.length === 0 && foodDays.length === 0) {
+    return normalizedSessions;
+  }
+
+  return normalizedSessions.map((session) => {
+    if (sessionLooksLikeMovement(session) && workoutDays.length > 0) {
+      return { ...session, selectedDays: workoutDays };
+    }
+
+    if (sessionLooksLikeFood(session) && foodDays.length > 0) {
+      return { ...session, selectedDays: foodDays };
+    }
+
+    return session;
+  });
+};
+
+const getSessionDays = (session = {}, fallbackDays = []) => {
+  const sessionDays = normalizeGoalSelectedDays(session?.selectedDays);
+  return sessionDays.length > 0 ? sessionDays : normalizeGoalSelectedDays(fallbackDays);
+};
+
+const collectSelectedDaysFromSessions = (sessionTimes = [], fallbackDays = []) => {
+  const days = [];
+  for (const session of normalizeGoalSessionTimes(sessionTimes)) {
+    days.push(...getSessionDays(session, fallbackDays));
+  }
+
+  return normalizeGoalSelectedDays(days.length > 0 ? days : fallbackDays);
 };
 
 const replyAsksForResolvedDetail = (reply = "", checklist = {}) => {
@@ -2237,7 +2347,15 @@ const buildGoalFinalSummaryReply = (goalDraft = {}) => {
   }
 
   const daysText = formatGoalDaysForUser(goalDraft?.selectedDays);
-  if (daysText) details.push(daysText);
+  const sessionTimes = normalizeGoalSessionTimes(
+    goalDraft?.sessionTimes,
+    goalDraft?.sessionTime,
+  );
+  const hasSessionSpecificDays = sessionTimes.some(
+    (session) => normalizeGoalSelectedDays(session?.selectedDays).length > 0,
+  );
+
+  if (daysText && !hasSessionSpecificDays) details.push(daysText);
 
   const startDate = String(goalDraft?.goalStartDate ?? "").trim();
   if (startDate) details.push(`starts ${formatGoalDateForUser(startDate)}`);
@@ -2252,20 +2370,20 @@ const buildGoalFinalSummaryReply = (goalDraft = {}) => {
     details.push("no end date");
   }
 
-  const sessionTimes = normalizeGoalSessionTimes(
-    goalDraft?.sessionTimes,
-    goalDraft?.sessionTime,
-  );
   if (sessionTimes.length > 0) {
     details.push(
       sessionTimes
         .map(
           (session) => {
             const label = String(session?.label ?? "").trim();
+            const sessionDays = normalizeGoalSelectedDays(session?.selectedDays);
+            const sessionDaysText = sessionDays.length > 0
+              ? `${formatGoalDaysForUser(sessionDays)} `
+              : "";
             const timeText = `${formatGoalTimeForUser(session.startTime)} to ${formatGoalTimeForUser(
               session.endTime,
             )}`;
-            return label ? `${label}: ${timeText}` : timeText;
+            return label ? `${label}: ${sessionDaysText}${timeText}` : `${sessionDaysText}${timeText}`.trim();
           },
         )
         .join(", "),
@@ -2522,19 +2640,22 @@ const ensurePlanCoversRequiredParts = ({
   }
 
   const selectedDays = normalizeGoalSelectedDays(goalMeta?.selectedDays);
-  if (selectedDays.length === 0) return planItems;
 
   const foodStyle = getFoodStyleFromText(`${conversationText} ${getGoalDraftSearchText(goalMeta)}`);
   const additions = [];
-  for (const day of selectedDays) {
-    if (!hasFood) {
-      for (const session of foodSessions) {
+  if (!hasFood) {
+    for (const session of foodSessions) {
+      const daysForSession = getSessionDays(session, selectedDays);
+      for (const day of daysForSession) {
         additions.push(buildFoodSupportShift(session, day, foodStyle));
       }
     }
+  }
 
-    if (!hasMovement) {
-      for (const session of movementSessions) {
+  if (!hasMovement) {
+    for (const session of movementSessions) {
+      const daysForSession = getSessionDays(session, selectedDays);
+      for (const day of daysForSession) {
         additions.push(buildWorkoutSupportShift(session, day));
       }
     }
@@ -2956,11 +3077,13 @@ const buildReminderPlanFromGoalMeta = (currentGoalMeta = null) => {
       sessionTimes.some((session) => String(session?.label ?? "").trim())
     );
 
-  if (!hasReminderShape || selectedDays.length === 0) return null;
+  const allSelectedDays = collectSelectedDaysFromSessions(sessionTimes, selectedDays);
+  if (!hasReminderShape || allSelectedDays.length === 0) return null;
 
   const plan = [];
-  for (const day of selectedDays) {
-    for (const session of sessionTimes) {
+  for (const session of sessionTimes) {
+    const daysForSession = getSessionDays(session, allSelectedDays);
+    for (const day of daysForSession) {
       const label = normalizeReminderLabel(session.label || "Reminder");
       plan.push({
         title: label,
@@ -3035,12 +3158,23 @@ const getPlanSelectedDays = (planItems = []) => {
 
 const mergeGoalSessionTimes = (existing = [], additions = []) => {
   const merged = [];
-  const seen = new Set();
+  const seen = new Map();
 
   for (const session of [...normalizeGoalSessionTimes(existing), ...normalizeGoalSessionTimes(additions)]) {
     const key = `${session.startTime}|${session.endTime}|${normalizeCoachTextForComparison(session.label)}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+    if (seen.has(key)) {
+      const index = seen.get(key);
+      merged[index] = {
+        ...merged[index],
+        ...session,
+        selectedDays: normalizeGoalSelectedDays([
+          ...(merged[index]?.selectedDays || []),
+          ...(session?.selectedDays || []),
+        ]),
+      };
+      continue;
+    }
+    seen.set(key, merged.length);
     merged.push(session);
   }
 
@@ -5485,6 +5619,7 @@ Generate the next Goach reply now.`,
     const inferredSelectedDays = inferredSelectedDaysFromRaw.length > 0
       ? inferredSelectedDaysFromRaw
       : inferSelectedDaysFromText(latestUserMessage);
+    const inferredPartDayScopes = inferPartDayScopesFromText(latestUserMessage);
     const previousAskedForDays = /\b(which days|what days|days should this happen|every day|mon to fri|specific days)\b/i.test(previousAssistantReply);
     const canUseInferredSelectedDays =
       currentSelectedDays.length === 0 &&
@@ -5535,7 +5670,7 @@ Generate the next Goach reply now.`,
       inferredSessionTimes.length > 0 &&
       (previousAskedForTime || inferredSleepSessionTimes.length > 0 || inferredLabeledReminderSessionTimes.length > 0) &&
       !inferredSessionNeedsConfirmation;
-    const sessionTimes = inferredSessionsLookMoreComplete
+    const baseSessionTimes = inferredSessionsLookMoreComplete
       ? inferredSessionTimes
       : incomingSessionTimes.length > 0 &&
       (fieldUpdates.sessionTimes || currentSessionTimes.length === 0)
@@ -5543,7 +5678,11 @@ Generate the next Goach reply now.`,
         : canUseInferredSessionTime
           ? inferredSessionTimes
           : currentSessionTimes;
-    if (canUseInferredSessionTime || inferredSessionsLookMoreComplete) {
+    const sessionTimes = applyPartDayScopesToSessions(baseSessionTimes, inferredPartDayScopes);
+    const hasPartDayScopes =
+      normalizeGoalSelectedDays(inferredPartDayScopes.workout).length > 0 ||
+      normalizeGoalSelectedDays(inferredPartDayScopes.food).length > 0;
+    if (canUseInferredSessionTime || inferredSessionsLookMoreComplete || hasPartDayScopes) {
       fieldUpdates.sessionTimes = true;
     }
 
@@ -6247,6 +6386,8 @@ Rules:
 - If the user chose multiple plan parts, such as food + workout, each agreed part must appear in the plan as useful coaching content.
 - For food + workout plans, do not return only workout shifts or only meal reminders. Include meal guidance and workout actions.
 - If currentGoalMeta.sessionTimes contains labels like Breakfast, Lunch, Dinner, Snack, Workout, Walking, or Food Check-In, use those labels to create matching shifts at those exact times.
+- If a sessionTime item has selectedDays, that session must use those days even if goalMeta.selectedDays contains more days. Example: Workout selectedDays Mon-Sat, Breakfast/Lunch/Dinner selectedDays Mon-Sun means workout shifts Mon-Sat and meal shifts Mon-Sun.
+- For multi-part plans, goalMeta.selectedDays may be the union of all active days. Do not use that union to overwrite a more specific sessionTime.selectedDays.
 - Do not treat meal times as plain reminders when the goal is weight loss, weight gain, health, fitness, or body change. They are coaching shifts and must include what to eat or how to choose food.
 - Do not use reminder-style wording like "Pause, do the reminder action" for coaching plans. That wording is only for pure reminders.
 - Recurring weekday shifts are schedule templates and must preserve the user's confirmed session time.
