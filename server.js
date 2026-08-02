@@ -149,11 +149,14 @@ const normalizeGoalTimeValue = (value = "") => {
   const meridiem = match[3];
 
   if (minute < 0 || minute > 59) return "";
-  if (meridiem && (hour < 1 || hour > 12)) return "";
+  if (meridiem && hour > 12 && hour <= 23) {
+    // Users sometimes mix 24-hour time with am/pm, like "22 30pm". Keep the 24-hour value.
+  } else {
+    if (meridiem && (hour < 1 || hour > 12)) return "";
+    if (meridiem === "am" && hour === 12) hour = 0;
+    if (meridiem === "pm" && hour !== 12) hour += 12;
+  }
   if (!meridiem && (hour < 0 || hour > 23)) return "";
-
-  if (meridiem === "am" && hour === 12) hour = 0;
-  if (meridiem === "pm" && hour !== 12) hour += 12;
 
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 };
@@ -342,8 +345,8 @@ const inferSleepSessionTimesFromText = (text = "") => {
     const after = raw.slice(item.index + item.raw.length, item.index + item.raw.length + 36);
     const context = `${before} ${after}`;
 
-    if (/\b(wake|waking|wake up|get up)\b/.test(context)) return "wake";
-    if (/\b(sleep|sleeping|bedtime|bed time|bed)\b/.test(context)) return "bed";
+    if (/\b(wake|waking|wake up|get up|morning time|morning)\b/.test(context)) return "wake";
+    if (/\b(sleep|sleeping|bedtime|bed time|bed|night time|night)\b/.test(context)) return "bed";
     return "";
   };
 
@@ -389,11 +392,27 @@ const buildSessionTimeConfirmationReply = (sessionTimes = []) => {
   if (sessions.length > 1) {
     const starts = sessions.map((item) => formatGoalTimeForUser(item.startTime)).join(", ");
     const proposed = sessions
-      .map((item) => `${formatGoalTimeForUser(item.startTime)} to ${formatGoalTimeForUser(item.endTime)}`)
+      .map((item) => {
+        const label = String(item?.label ?? item?.purpose ?? "").trim();
+        const timeText = `${formatGoalTimeForUser(item.startTime)} to ${formatGoalTimeForUser(item.endTime)}`;
+        return label ? `${normalizeReminderLabel(label)}: ${timeText}` : timeText;
+      })
       .join(", ");
+    const hasSleepPair = sessions.some((item) => /\b(bed|bedtime|sleep)\b/i.test(String(item?.label ?? item?.purpose ?? ""))) &&
+      sessions.some((item) => /\b(wake|wake up|waking)\b/i.test(String(item?.label ?? item?.purpose ?? "")));
+    if (hasSleepPair) {
+      return `I have bedtime and wake-up here: ${proposed}. Should I keep them like that?`;
+    }
     return `I have these times: ${starts}. Should I make each session 1 hour, like ${proposed}?`;
   }
 
+  const label = String(session?.label ?? session?.purpose ?? "").trim();
+  if (/\b(wake|wake up|waking)\b/i.test(label)) {
+    return `I will use ${formatGoalTimeForUser(session.startTime)} as the wake-up time. Should I keep it as a short wake-up reminder?`;
+  }
+  if (/\b(bed|bedtime|sleep)\b/i.test(label)) {
+    return `I will use ${formatGoalTimeForUser(session.startTime)} as the bedtime. Should I keep it as a short bedtime reminder?`;
+  }
   return `I will use ${formatGoalTimeForUser(session.startTime)}. For this kind of session, I suggest ${formatGoalTimeForUser(session.startTime)} to ${formatGoalTimeForUser(session.endTime)}. Does that work?`;
 };
 
@@ -5649,14 +5668,14 @@ Generate the next Goach reply now.`,
       incomingGoalDraft.sessionTimes,
       incomingGoalDraft.sessionTime,
     );
-    const inferredLabeledReminderSessionTimes = inferLabeledReminderSessionTimesFromText(latestUserMessage);
-    const inferredSleepSessionTimes = inferredLabeledReminderSessionTimes.length > 0
+    const inferredSleepSessionTimes = inferSleepSessionTimesFromText(latestUserMessage);
+    const inferredLabeledReminderSessionTimes = inferredSleepSessionTimes.length > 0
       ? []
-      : inferSleepSessionTimesFromText(latestUserMessage);
-    const inferredSessionTimes = inferredLabeledReminderSessionTimes.length > 0
-      ? inferredLabeledReminderSessionTimes
-      : inferredSleepSessionTimes.length > 0
-        ? inferredSleepSessionTimes
+      : inferLabeledReminderSessionTimesFromText(latestUserMessage);
+    const inferredSessionTimes = inferredSleepSessionTimes.length > 0
+      ? inferredSleepSessionTimes
+      : inferredLabeledReminderSessionTimes.length > 0
+        ? inferredLabeledReminderSessionTimes
         : inferSingleSessionTimeFromText(latestUserMessage);
     const previousAskedForTime = /\b(time|what time|when should|when do you want|time of day)\b/i.test(previousAssistantReply);
     const inferredSessionNeedsConfirmation = inferredSessionTimes.some((session) => session.inferredEndTime);
@@ -7640,55 +7659,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`AI backend running on http://0.0.0.0:${PORT}`);
 });
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
