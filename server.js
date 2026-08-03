@@ -28,6 +28,17 @@ const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 const PAYSTACK_PREMIUM_PLAN_CODE = process.env.PAYSTACK_PREMIUM_PLAN_CODE;
 const PAYSTACK_MINI_PLAN_CODE = process.env.PAYSTACK_MINI_PLAN_CODE;
 const PAYSTACK_STANDARD_PLAN_CODE = process.env.PAYSTACK_STANDARD_PLAN_CODE;
+const BILLING_PROVIDER = String(process.env.BILLING_PROVIDER || "paystack").trim().toLowerCase();
+const LEMON_SQUEEZY_API_KEY = process.env.LEMON_SQUEEZY_API_KEY;
+const LEMON_SQUEEZY_STORE_ID = process.env.LEMON_SQUEEZY_STORE_ID;
+const LEMON_SQUEEZY_WEBHOOK_SECRET = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
+const LEMON_SQUEEZY_TEST_MODE = String(process.env.LEMON_SQUEEZY_TEST_MODE || "false").toLowerCase() === "true";
+const LEMON_SQUEEZY_MINI_VARIANT_ID = process.env.LEMON_SQUEEZY_MINI_VARIANT_ID;
+const LEMON_SQUEEZY_STANDARD_VARIANT_ID = process.env.LEMON_SQUEEZY_STANDARD_VARIANT_ID;
+const LEMON_SQUEEZY_PREMIUM_VARIANT_ID = process.env.LEMON_SQUEEZY_PREMIUM_VARIANT_ID;
+const LEMON_SQUEEZY_CREDITS_50_VARIANT_ID = process.env.LEMON_SQUEEZY_CREDITS_50_VARIANT_ID;
+const LEMON_SQUEEZY_CREDITS_150_VARIANT_ID = process.env.LEMON_SQUEEZY_CREDITS_150_VARIANT_ID;
+const LEMON_SQUEEZY_CREDITS_250_VARIANT_ID = process.env.LEMON_SQUEEZY_CREDITS_250_VARIANT_ID;
 const APP_BILLING_CALLBACK_URL =
   process.env.APP_BILLING_CALLBACK_URL || "https://example.com/billing/callback";
 
@@ -951,9 +962,43 @@ const paystackRequest = async (path, options = {}) => {
   return data;
 };
 
+const lemonSqueezyRequest = async (path, options = {}) => {
+  if (!LEMON_SQUEEZY_API_KEY) {
+    throw new Error("LEMON_SQUEEZY_API_KEY is not configured");
+  }
+
+  const response = await fetch(`https://api.lemonsqueezy.com${path}`, {
+    ...options,
+    headers: {
+      Accept: "application/vnd.api+json",
+      "Content-Type": "application/vnd.api+json",
+      Authorization: `Bearer ${LEMON_SQUEEZY_API_KEY}`,
+      ...(options.headers || {}),
+    },
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const detail = data?.errors?.[0]?.detail || data?.errors?.[0]?.title;
+    throw new Error(detail || "Lemon Squeezy request failed");
+  }
+
+  return data;
+};
+
+const getActiveBillingProvider = () => (BILLING_PROVIDER === "lemon" ? "lemon" : "paystack");
+
 const requireBillingConfig = () => {
   if (!supabaseAdmin) {
     throw new Error("Supabase service role is not configured");
+  }
+
+  if (getActiveBillingProvider() === "lemon") {
+    if (!LEMON_SQUEEZY_API_KEY || !LEMON_SQUEEZY_STORE_ID) {
+      throw new Error("Lemon Squeezy billing is not configured");
+    }
+    return;
   }
 
   if (!PAYSTACK_SECRET_KEY) {
@@ -995,6 +1040,7 @@ const BILLING_PLANS = {
     baseAmount: 700,
     credits: 50,
     paystackPlanCode: PAYSTACK_MINI_PLAN_CODE,
+    lemonVariantId: LEMON_SQUEEZY_MINI_VARIANT_ID,
   },
   standard: {
     id: "standard",
@@ -1002,6 +1048,7 @@ const BILLING_PLANS = {
     baseAmount: 1800,
     credits: 150,
     paystackPlanCode: PAYSTACK_STANDARD_PLAN_CODE,
+    lemonVariantId: LEMON_SQUEEZY_STANDARD_VARIANT_ID,
   },
   premium: {
     id: "premium",
@@ -1009,6 +1056,7 @@ const BILLING_PLANS = {
     baseAmount: 2800,
     credits: 250,
     paystackPlanCode: PAYSTACK_PREMIUM_PLAN_CODE,
+    lemonVariantId: LEMON_SQUEEZY_PREMIUM_VARIANT_ID,
   },
 };
 
@@ -1018,18 +1066,21 @@ const CREDIT_PACKS = {
     name: "50 Goach Credits",
     baseAmount: 700,
     credits: 50,
+    lemonVariantId: LEMON_SQUEEZY_CREDITS_50_VARIANT_ID,
   },
   credits_150: {
     id: "credits_150",
     name: "150 Goach Credits",
     baseAmount: 1800,
     credits: 150,
+    lemonVariantId: LEMON_SQUEEZY_CREDITS_150_VARIANT_ID,
   },
   credits_250: {
     id: "credits_250",
     name: "250 Goach Credits",
     baseAmount: 2800,
     credits: 250,
+    lemonVariantId: LEMON_SQUEEZY_CREDITS_250_VARIANT_ID,
   },
 };
 const CREDIT_RULES = {
@@ -1080,6 +1131,284 @@ const isActivePaidProfile = (profile = {}) => {
     ["mini", "standard", "premium"].includes(profile.plan) &&
     profile.subscription_status === "active"
   );
+};
+const getLemonCustomData = (event = {}) => {
+  return event?.meta?.custom_data || event?.data?.attributes?.checkout_data?.custom || {};
+};
+
+const getLemonEventReference = (event = {}) => {
+  const custom = getLemonCustomData(event);
+  const eventName = event?.meta?.event_name;
+
+  if (eventName === "subscription_payment_success") {
+    return event?.data?.id || custom.checkoutReference || event?.meta?.event_id || null;
+  }
+
+  return custom.checkoutReference || event?.data?.id || event?.meta?.event_id || null;
+};
+
+const getLemonVariantId = (event = {}) => {
+  return String(
+    event?.data?.attributes?.variant_id ||
+      event?.data?.relationships?.variant?.data?.id ||
+      "",
+  ).trim();
+};
+
+const getBillingPlanFromLemonEvent = (event = {}) => {
+  const custom = getLemonCustomData(event);
+  const metadataPlan = getBillingPlan(custom.planId);
+  if (metadataPlan) return metadataPlan;
+
+  const variantId = getLemonVariantId(event);
+  if (!variantId) return null;
+
+  return (
+    Object.values(BILLING_PLANS).find(
+      (plan) => String(plan.lemonVariantId || "").trim() === variantId,
+    ) ?? null
+  );
+};
+
+const getCreditPackFromLemonEvent = (event = {}) => {
+  const custom = getLemonCustomData(event);
+  const metadataPack = getCreditPack(custom.packId);
+  if (metadataPack) return metadataPack;
+
+  const variantId = getLemonVariantId(event);
+  if (!variantId) return null;
+
+  return (
+    Object.values(CREDIT_PACKS).find(
+      (pack) => String(pack.lemonVariantId || "").trim() === variantId,
+    ) ?? null
+  );
+};
+
+const createLemonCheckout = async ({ variantId, email, customData, previewText }) => {
+  if (!variantId) {
+    throw new Error("Lemon Squeezy variant ID is not configured for this item");
+  }
+
+  const returnUrl = `${APP_BILLING_CALLBACK_URL}?reference=${encodeURIComponent(
+    customData.checkoutReference,
+  )}`;
+  const payload = {
+    data: {
+      type: "checkouts",
+      attributes: {
+        test_mode: LEMON_SQUEEZY_TEST_MODE,
+        checkout_data: {
+          email,
+          custom: customData,
+        },
+        product_options: {
+          redirect_url: returnUrl,
+          receipt_button_text: "Return to PIDA",
+          receipt_link_url: returnUrl,
+          enabled_variants: [Number(variantId)],
+          description: previewText,
+        },
+      },
+      relationships: {
+        store: {
+          data: {
+            type: "stores",
+            id: String(LEMON_SQUEEZY_STORE_ID),
+          },
+        },
+        variant: {
+          data: {
+            type: "variants",
+            id: String(variantId),
+          },
+        },
+      },
+    },
+  };
+
+  const checkout = await lemonSqueezyRequest("/v1/checkouts", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+
+  return {
+    authorizationUrl: checkout?.data?.attributes?.url,
+    accessCode: checkout?.data?.id,
+    reference: customData.checkoutReference,
+    provider: "lemon",
+  };
+};
+
+const verifyLemonWebhookSignature = (req) => {
+  const signature = String(req.headers["x-signature"] || "");
+  if (!LEMON_SQUEEZY_WEBHOOK_SECRET || !signature || !req.rawBody) return false;
+
+  const expected = createHmac("sha256", LEMON_SQUEEZY_WEBHOOK_SECRET)
+    .update(req.rawBody)
+    .digest("hex");
+
+  const signatureBuffer = Buffer.from(signature, "hex");
+  const expectedBuffer = Buffer.from(expected, "hex");
+
+  return (
+    signatureBuffer.length === expectedBuffer.length &&
+    timingSafeEqual(signatureBuffer, expectedBuffer)
+  );
+};
+
+const applyLemonPlanPayment = async (event = {}) => {
+  if (!supabaseAdmin) {
+    throw new Error("Supabase service role is not configured");
+  }
+
+  const custom = getLemonCustomData(event);
+  const billingPlan = getBillingPlanFromLemonEvent(event);
+  const reference = getLemonEventReference(event);
+  const userId = custom.userId;
+
+  if (!billingPlan || !reference || !userId) {
+    return { applied: false, reason: "missing_plan_reference_or_user" };
+  }
+
+  const { data: profile, error: profileError } = await supabaseAdmin
+    .from("profiles")
+    .select("id, ai_credits, payment_reference")
+    .eq("id", userId)
+    .single();
+
+  if (profileError || !profile) {
+    return { applied: false, reason: "profile_not_found" };
+  }
+
+  if (profile.payment_reference === reference) {
+    return { applied: false, reason: "already_applied" };
+  }
+
+  const attributes = event?.data?.attributes || {};
+  const currentPeriodEndsAt = attributes.renews_at || attributes.ends_at || attributes.current_period_ends_at
+    ? new Date(attributes.renews_at || attributes.ends_at || attributes.current_period_ends_at)
+    : addDays(new Date(), 30);
+  const existingCredits = Number(profile.ai_credits ?? 0);
+  const nextCredits = Math.max(0, existingCredits) + billingPlan.credits;
+  const subscriptionId = String(attributes.subscription_id || event?.data?.id || "").trim() || null;
+  const customerId = String(attributes.customer_id || "").trim() || null;
+  const billingEmail = attributes.user_email || attributes.customer_email || custom.email || null;
+
+  const { error: updateError } = await supabaseAdmin
+    .from("profiles")
+    .update({
+      plan: billingPlan.id,
+      ai_credits: nextCredits,
+      trial_used: true,
+      trial_started_at: null,
+      trial_ends_at: null,
+      subscription_status: "active",
+      subscription_provider: "lemon",
+      subscription_id: subscriptionId,
+      customer_id: customerId,
+      payment_authorization_code: null,
+      payment_reference: reference,
+      billing_email: billingEmail,
+      cancel_at_period_end: false,
+      current_period_ends_at: currentPeriodEndsAt.toISOString(),
+      pending_plan: null,
+      pending_plan_starts_at: null,
+    })
+    .eq("id", profile.id);
+
+  if (updateError) throw updateError;
+
+  const creditUser = await getOrCreateCreditUser(profile.id, billingPlan.id);
+  creditUser.credits = nextCredits;
+  creditUser.plan = billingPlan.id;
+
+  return {
+    applied: true,
+    userId: profile.id,
+    plan: billingPlan.id,
+    remainingCredits: nextCredits,
+  };
+};
+
+const applyLemonCreditPackPayment = async (event = {}) => {
+  if (!supabaseAdmin) {
+    throw new Error("Supabase service role is not configured");
+  }
+
+  const custom = getLemonCustomData(event);
+  const creditPack = getCreditPackFromLemonEvent(event);
+  const reference = getLemonEventReference(event);
+  const userId = custom.userId;
+
+  if (!creditPack || !reference || !userId) {
+    return { applied: false, reason: "missing_pack_reference_or_user" };
+  }
+
+  const { data: profile, error: profileError } = await supabaseAdmin
+    .from("profiles")
+    .select("id, plan, subscription_status, ai_credits, payment_reference")
+    .eq("id", userId)
+    .single();
+
+  if (profileError || !profile) {
+    return { applied: false, reason: "profile_not_found" };
+  }
+
+  if (!isActivePaidProfile(profile)) {
+    return { applied: false, reason: "paid_plan_required" };
+  }
+
+  if (profile.payment_reference === reference) {
+    return { applied: false, reason: "already_applied" };
+  }
+
+  const attributes = event?.data?.attributes || {};
+  const existingCredits = Number(profile.ai_credits ?? 0);
+  const nextCredits = Math.max(0, existingCredits) + creditPack.credits;
+  const billingEmail = attributes.user_email || attributes.customer_email || custom.email || null;
+
+  const { error: updateError } = await supabaseAdmin
+    .from("profiles")
+    .update({
+      ai_credits: nextCredits,
+      payment_reference: reference,
+      billing_email: billingEmail,
+    })
+    .eq("id", profile.id);
+
+  if (updateError) throw updateError;
+
+  const creditUser = await getOrCreateCreditUser(profile.id, profile.plan);
+  creditUser.credits = nextCredits;
+  creditUser.plan = profile.plan;
+
+  return {
+    applied: true,
+    userId: profile.id,
+    pack: creditPack.id,
+    addedCredits: creditPack.credits,
+    remainingCredits: nextCredits,
+  };
+};
+
+const disableLemonSubscriptionById = async (subscriptionId) => {
+  if (!subscriptionId) return { disabled: false, reason: "missing_subscription" };
+
+  await lemonSqueezyRequest(`/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      data: {
+        type: "subscriptions",
+        id: String(subscriptionId),
+        attributes: {
+          cancelled: true,
+        },
+      },
+    }),
+  });
+
+  return { disabled: true };
 };
 
 const getBillingPlanByPaystackCode = (planCode = "") => {
@@ -1156,6 +1485,16 @@ const disablePaystackSubscriptionByCode = async (code, token) => {
   });
 
   return { disabled: true };
+};
+const disableBillingSubscription = async (profile = {}) => {
+  if (profile.subscription_provider === "lemon") {
+    return disableLemonSubscriptionById(profile.subscription_id);
+  }
+
+  return disablePaystackSubscriptionByCode(
+    profile.subscription_id,
+    profile.subscription_email_token,
+  );
 };
 
 const verifyPaystackWebhookSignature = (req) => {
@@ -4704,6 +5043,60 @@ app.post("/billing/paystack-webhook", async (req, res) => {
   }
 });
 
+app.post("/billing/lemon-webhook", async (req, res) => {
+  try {
+    if (!verifyLemonWebhookSignature(req)) {
+      return res.status(401).json({ error: "Invalid Lemon Squeezy signature" });
+    }
+
+    const event = req.body;
+    const eventName = event?.meta?.event_name;
+    const custom = getLemonCustomData(event);
+    const purpose = custom?.purpose;
+
+    if (eventName === "order_created") {
+      if (purpose !== "goach_credit_pack") {
+        return res.json({ ok: true, ignored: true });
+      }
+
+      const result = await applyLemonCreditPackPayment(event);
+      return res.json({ ok: true, result });
+    }
+
+    if (eventName === "subscription_created" || eventName === "subscription_payment_success") {
+      const result = await applyLemonPlanPayment(event);
+      return res.json({ ok: true, result });
+    }
+
+    if (eventName === "subscription_cancelled" || eventName === "subscription_expired") {
+      const subscriptionId = String(event?.data?.id || "").trim();
+      const customerId = String(event?.data?.attributes?.customer_id || "").trim();
+      let query = supabaseAdmin.from("profiles").update({
+        subscription_status: "inactive",
+        cancel_at_period_end: false,
+      });
+
+      if (subscriptionId) {
+        query = query.eq("subscription_id", subscriptionId);
+      } else if (customerId) {
+        query = query.eq("customer_id", customerId);
+      } else {
+        return res.json({ ok: true, ignored: true, reason: "missing_subscription_or_customer" });
+      }
+
+      const { error } = await query;
+      if (error) throw error;
+      return res.json({ ok: true, result: { applied: true } });
+    }
+
+    return res.json({ ok: true, ignored: true });
+  } catch (error) {
+    console.log("LEMON WEBHOOK ERROR:", error);
+    res.status(500).json({
+      error: error?.message || "Failed to process Lemon Squeezy webhook",
+    });
+  }
+});
 const startCreditPackCheckoutHandler = async (req, res) => {
   try {
     requireBillingConfig();
@@ -4748,6 +5141,27 @@ const startCreditPackCheckoutHandler = async (req, res) => {
     }
 
     const reference = `credits_${creditPack.credits}_${userId}_${Date.now()}`;
+
+    if (getActiveBillingProvider() === "lemon") {
+      const checkout = await createLemonCheckout({
+        variantId: creditPack.lemonVariantId,
+        email,
+        customData: {
+          userId,
+          email,
+          packId: creditPack.id,
+          packName: creditPack.name,
+          credits: creditPack.credits,
+          baseAmount: creditPack.baseAmount,
+          payableAmount: Number(amount),
+          purpose: "goach_credit_pack",
+          checkoutReference: reference,
+        },
+        previewText: `${creditPack.name} top-up for PIDA`,
+      });
+
+      return res.json(checkout);
+    }
 
     const paystackData = await paystackRequest("/transaction/initialize", {
       method: "POST",
@@ -4795,11 +5209,33 @@ const verifyCreditPackCheckoutHandler = async (req, res) => {
       });
     }
 
+    if (getActiveBillingProvider() === "lemon") {
+      const { data: profile, error: profileError } = await supabaseAdmin
+        .from("profiles")
+        .select("ai_credits, payment_reference")
+        .eq("id", userId)
+        .single();
+
+      if (profileError || !profile) {
+        return res.status(404).json({ error: "Profile not found" });
+      }
+
+      if (profile.payment_reference !== reference) {
+        return res.status(409).json({
+          error: "Payment is still processing. Wait a few seconds, then tap verify again.",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        remainingCredits: Number(profile.ai_credits ?? 0),
+      });
+    }
+
     const verification = await paystackRequest(
       `/transaction/verify/${encodeURIComponent(reference)}`,
       { method: "GET" },
     );
-
     const transaction = verification.data;
 
     if (transaction.status !== "success") {
@@ -4859,7 +5295,7 @@ const schedulePlanChangeHandler = async (req, res) => {
 
     const { data: profile, error: profileError } = await supabaseAdmin
       .from("profiles")
-      .select("id, plan, subscription_status, current_period_ends_at, subscription_id, subscription_email_token")
+      .select("id, plan, subscription_status, subscription_provider, current_period_ends_at, subscription_id, subscription_email_token")
       .eq("id", userId)
       .single();
 
@@ -4889,10 +5325,7 @@ const schedulePlanChangeHandler = async (req, res) => {
       ? new Date(profile.current_period_ends_at)
       : addDays(new Date(), 30);
 
-    const disableResult = await disablePaystackSubscriptionByCode(
-      profile.subscription_id,
-      profile.subscription_email_token,
-    );
+    const disableResult = await disableBillingSubscription(profile);
 
     const { error: updateError } = await supabaseAdmin
       .from("profiles")
@@ -4980,6 +5413,27 @@ const startPlanCheckoutHandler = async (req, res) => {
 
     const reference = `plan_${billingPlan.id}_${userId}_${Date.now()}`;
 
+    if (getActiveBillingProvider() === "lemon") {
+      const checkout = await createLemonCheckout({
+        variantId: billingPlan.lemonVariantId,
+        email,
+        customData: {
+          userId,
+          email,
+          planId: billingPlan.id,
+          planName: billingPlan.name,
+          credits: billingPlan.credits,
+          baseAmount: billingPlan.baseAmount,
+          payableAmount: Number(amount),
+          purpose: "goach_plan_subscription",
+          checkoutReference: reference,
+        },
+        previewText: `${billingPlan.name} subscription for PIDA`,
+      });
+
+      return res.json(checkout);
+    }
+
     const paystackData = await paystackRequest("/transaction/initialize", {
       method: "POST",
       body: JSON.stringify({
@@ -5029,13 +5483,38 @@ const verifyPlanCheckoutHandler = async (req, res) => {
       });
     }
 
+    if (getActiveBillingProvider() === "lemon") {
+      const { data: profile, error: profileError } = await supabaseAdmin
+        .from("profiles")
+        .select("plan, subscription_status, ai_credits, current_period_ends_at, payment_reference")
+        .eq("id", userId)
+        .single();
+
+      if (profileError || !profile) {
+        return res.status(404).json({ error: "Profile not found" });
+      }
+
+      if (profile.payment_reference !== reference || profile.subscription_status !== "active") {
+        return res.status(409).json({
+          error: "Payment is still processing. Wait a few seconds, then tap verify again.",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        plan: profile.plan,
+        subscriptionStatus: profile.subscription_status,
+        currentPeriodEndsAt: profile.current_period_ends_at,
+        remainingCredits: Number(profile.ai_credits ?? 0),
+      });
+    }
+
     const verification = await paystackRequest(
       `/transaction/verify/${encodeURIComponent(reference)}`,
       {
         method: "GET",
       },
     );
-
     const transaction = verification.data;
 
     if (transaction.status !== "success") {
