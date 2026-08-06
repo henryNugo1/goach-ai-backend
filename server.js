@@ -1355,10 +1355,6 @@ const applyLemonCreditPackPayment = async (event = {}) => {
     return { applied: false, reason: "profile_not_found" };
   }
 
-  if (!isActivePaidProfile(profile)) {
-    return { applied: false, reason: "paid_plan_required" };
-  }
-
   if (profile.payment_reference === reference) {
     return { applied: false, reason: "already_applied" };
   }
@@ -1621,10 +1617,6 @@ const applyPaystackCreditPackPayment = async (data = {}) => {
     return { applied: false, reason: "profile_not_found" };
   }
 
-  if (!isActivePaidProfile(profile)) {
-    return { applied: false, reason: "paid_plan_required" };
-  }
-
   if (profile.payment_reference === reference) {
     return { applied: false, reason: "already_applied" };
   }
@@ -1739,10 +1731,6 @@ const getOrCreateCreditUser = async (userId, planFromRequest = "free") => {
       credits = rules.initialCredits;
     }
 
-    if (plan === "free") {
-      credits = 0;
-    }
-
     const user = {
       credits,
       plan,
@@ -1773,8 +1761,6 @@ const getOrCreateCreditUser = async (userId, planFromRequest = "free") => {
 
   if (user.plan !== plan) {
     user.plan = plan;
-
-    if (plan === "free") user.credits = 0;
     if (plan !== "free") {
       user.credits = Math.max(
         user.credits,
@@ -1825,20 +1811,9 @@ try {
 
 const cost = getCost(req.path);
 
-
-  if (user.plan === "free") {
-    return res.status(403).json({
-      error: "Goach requires a paid plan",
-      upgrade: true,
-      remainingCredits: 0,
-      requiredCredits: cost,
-      plan: user.plan,
-    });
-  }
-
   if (user.credits < cost) {
     return res.status(403).json({
-      error: "Not enough AI credits",
+      error: "Not enough Goach credits",
       upgrade: user.plan === "free" || user.plan === "trial",
       remainingCredits: user.credits,
       requiredCredits: cost,
@@ -8138,4 +8113,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`AI backend running on http://0.0.0.0:${PORT}`);
 });
-
