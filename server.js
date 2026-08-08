@@ -1658,8 +1658,8 @@ const disablePaystackSubscription = async (data = {}) => {
   const customerCode = data.customer?.customer_code || data.customer_code;
 
   let query = supabaseAdmin.from("profiles").update({
-    subscription_status: "inactive",
-    cancel_at_period_end: false,
+    subscription_status: "cancelled",
+    cancel_at_period_end: true,
   });
 
   if (subscriptionCode) {
@@ -5270,7 +5270,7 @@ const schedulePlanChangeHandler = async (req, res) => {
 
     const { data: profile, error: profileError } = await supabaseAdmin
       .from("profiles")
-      .select("id, plan, subscription_status, subscription_provider, current_period_ends_at, subscription_id, subscription_email_token")
+      .select("id, plan, subscription_status, subscription_provider, cancel_at_period_end, current_period_ends_at, subscription_id, subscription_email_token")
       .eq("id", userId)
       .single();
 
@@ -5330,6 +5330,80 @@ const schedulePlanChangeHandler = async (req, res) => {
 };
 
 app.post("/billing/schedule-plan-change", schedulePlanChangeHandler);
+const cancelSubscriptionHandler = async (req, res) => {
+  try {
+    requireBillingConfig();
+
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "User ID is required" });
+    }
+
+    const { data: profile, error: profileError } = await supabaseAdmin
+      .from("profiles")
+      .select("id, plan, subscription_status, subscription_provider, cancel_at_period_end, current_period_ends_at, subscription_id, subscription_email_token")
+      .eq("id", userId)
+      .single();
+
+    if (profileError || !profile) {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+
+    if (!["mini", "standard", "premium"].includes(profile.plan)) {
+      return res.status(400).json({ error: "This account does not have a paid plan to cancel" });
+    }
+
+    if (profile.subscription_status === "cancelled" && profile.cancel_at_period_end) {
+      return res.json({
+        ok: true,
+        alreadyCancelled: true,
+        plan: profile.plan,
+        currentPeriodEndsAt: profile.current_period_ends_at,
+      });
+    }
+
+    if (profile.subscription_status !== "active") {
+      return res.status(400).json({ error: "Only active paid plans can be cancelled" });
+    }
+
+    const periodEndsAt = profile.current_period_ends_at
+      ? new Date(profile.current_period_ends_at)
+      : addDays(new Date(), 30);
+
+    const disableResult = await disableBillingSubscription(profile);
+
+    if (!disableResult.disabled) {
+      return res.status(400).json({ error: "Subscription details are missing. Please contact support." });
+    }
+
+    const { error: updateError } = await supabaseAdmin
+      .from("profiles")
+      .update({
+        subscription_status: "cancelled",
+        cancel_at_period_end: true,
+        current_period_ends_at: periodEndsAt.toISOString(),
+        pending_plan: null,
+        pending_plan_starts_at: null,
+      })
+      .eq("id", userId);
+
+    if (updateError) throw updateError;
+
+    res.json({
+      ok: true,
+      plan: profile.plan,
+      currentPeriodEndsAt: periodEndsAt.toISOString(),
+    });
+  } catch (error) {
+    console.log("CANCEL SUBSCRIPTION ERROR:", error);
+    res.status(500).json({
+      error: error?.message || "Failed to cancel subscription",
+    });
+  }
+};
+
+app.post("/billing/cancel-subscription", cancelSubscriptionHandler);
 
 const startPlanCheckoutHandler = async (req, res) => {
   try {
