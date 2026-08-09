@@ -988,13 +988,21 @@ const lemonSqueezyRequest = async (path, options = {}) => {
 };
 
 const getActiveBillingProvider = () => (BILLING_PROVIDER === "lemon" ? "lemon" : "paystack");
+const normalizeBillingProvider = (provider = "") => {
+  const value = String(provider || "").trim().toLowerCase();
+  if (value === "lemon" || value === "lemonsqueezy" || value === "lemon_squeezy") return "lemon";
+  if (value === "paystack") return "paystack";
+  return getActiveBillingProvider();
+};
 
-const requireBillingConfig = () => {
+const requireBillingConfig = (provider) => {
   if (!supabaseAdmin) {
     throw new Error("Supabase service role is not configured");
   }
 
-  if (getActiveBillingProvider() === "lemon") {
+  const activeProvider = normalizeBillingProvider(provider);
+
+  if (activeProvider === "lemon") {
     if (!LEMON_SQUEEZY_API_KEY || !LEMON_SQUEEZY_STORE_ID) {
       throw new Error("Lemon Squeezy billing is not configured");
     }
@@ -5074,7 +5082,8 @@ app.post("/billing/lemon-webhook", async (req, res) => {
 });
 const startCreditPackCheckoutHandler = async (req, res) => {
   try {
-    requireBillingConfig();
+    const provider = normalizeBillingProvider(req.body?.billingProvider);
+    requireBillingConfig(provider);
 
     const { userId, email, packId, amount, baseAmount, credits } = req.body;
     const creditPack = getCreditPack(packId);
@@ -5109,15 +5118,9 @@ const startCreditPackCheckoutHandler = async (req, res) => {
       return res.status(404).json({ error: "Profile not found" });
     }
 
-    if (!isActivePaidProfile(profile)) {
-      return res.status(403).json({
-        error: "Choose a monthly plan before buying extra Goach credits",
-      });
-    }
-
     const reference = `credits_${creditPack.credits}_${userId}_${Date.now()}`;
 
-    if (getActiveBillingProvider() === "lemon") {
+    if (provider === "lemon") {
       const checkout = await createLemonCheckout({
         variantId: creditPack.lemonVariantId,
         email,
@@ -5163,6 +5166,7 @@ const startCreditPackCheckoutHandler = async (req, res) => {
       authorizationUrl: paystackData.data.authorization_url,
       accessCode: paystackData.data.access_code,
       reference: paystackData.data.reference,
+      provider: "paystack",
     });
   } catch (error) {
     console.log("START CREDIT PACK CHECKOUT ERROR:", error);
@@ -5174,7 +5178,8 @@ const startCreditPackCheckoutHandler = async (req, res) => {
 
 const verifyCreditPackCheckoutHandler = async (req, res) => {
   try {
-    requireBillingConfig();
+    const provider = normalizeBillingProvider(req.body?.billingProvider);
+    requireBillingConfig(provider);
 
     const { userId, reference } = req.body;
 
@@ -5184,7 +5189,7 @@ const verifyCreditPackCheckoutHandler = async (req, res) => {
       });
     }
 
-    if (getActiveBillingProvider() === "lemon") {
+    if (provider === "lemon") {
       const { data: profile, error: profileError } = await supabaseAdmin
         .from("profiles")
         .select("ai_credits, payment_reference")
@@ -5252,7 +5257,6 @@ const verifyCreditPackCheckoutHandler = async (req, res) => {
 
 app.post("/billing/start-credit-pack", startCreditPackCheckoutHandler);
 app.post("/billing/verify-credit-pack", verifyCreditPackCheckoutHandler);
-
 const schedulePlanChangeHandler = async (req, res) => {
   try {
     requireBillingConfig();
@@ -5407,7 +5411,8 @@ app.post("/billing/cancel-subscription", cancelSubscriptionHandler);
 
 const startPlanCheckoutHandler = async (req, res) => {
   try {
-    requireBillingConfig();
+    const provider = normalizeBillingProvider(req.body?.billingProvider);
+    requireBillingConfig(provider);
 
     const { userId, email, planId, amount, baseAmount, credits } = req.body;
     const billingPlan = getBillingPlan(planId);
@@ -5462,7 +5467,7 @@ const startPlanCheckoutHandler = async (req, res) => {
 
     const reference = `plan_${billingPlan.id}_${userId}_${Date.now()}`;
 
-    if (getActiveBillingProvider() === "lemon") {
+    if (provider === "lemon") {
       const checkout = await createLemonCheckout({
         variantId: billingPlan.lemonVariantId,
         email,
@@ -5508,6 +5513,7 @@ const startPlanCheckoutHandler = async (req, res) => {
       authorizationUrl: paystackData.data.authorization_url,
       accessCode: paystackData.data.access_code,
       reference: paystackData.data.reference,
+      provider: "paystack",
     });
   } catch (error) {
     console.log("START PLAN CHECKOUT ERROR:", error);
@@ -5522,7 +5528,8 @@ app.post("/billing/start-trial", startPlanCheckoutHandler);
 
 const verifyPlanCheckoutHandler = async (req, res) => {
   try {
-    requireBillingConfig();
+    const provider = normalizeBillingProvider(req.body?.billingProvider);
+    requireBillingConfig(provider);
 
     const { userId, reference } = req.body;
 
@@ -5532,7 +5539,7 @@ const verifyPlanCheckoutHandler = async (req, res) => {
       });
     }
 
-    if (getActiveBillingProvider() === "lemon") {
+    if (provider === "lemon") {
       const { data: profile, error: profileError } = await supabaseAdmin
         .from("profiles")
         .select("plan, subscription_status, ai_credits, current_period_ends_at, payment_reference")
@@ -5557,7 +5564,6 @@ const verifyPlanCheckoutHandler = async (req, res) => {
         remainingCredits: Number(profile.ai_credits ?? 0),
       });
     }
-
     const verification = await paystackRequest(
       `/transaction/verify/${encodeURIComponent(reference)}`,
       {
