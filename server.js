@@ -39,6 +39,14 @@ const LEMON_SQUEEZY_PREMIUM_VARIANT_ID = process.env.LEMON_SQUEEZY_PREMIUM_VARIA
 const LEMON_SQUEEZY_CREDITS_50_VARIANT_ID = process.env.LEMON_SQUEEZY_CREDITS_50_VARIANT_ID;
 const LEMON_SQUEEZY_CREDITS_150_VARIANT_ID = process.env.LEMON_SQUEEZY_CREDITS_150_VARIANT_ID;
 const LEMON_SQUEEZY_CREDITS_250_VARIANT_ID = process.env.LEMON_SQUEEZY_CREDITS_250_VARIANT_ID;
+const PADDLE_API_KEY = process.env.PADDLE_API_KEY;
+const PADDLE_WEBHOOK_SECRET = process.env.PADDLE_WEBHOOK_SECRET;
+const PADDLE_ENVIRONMENT = String(process.env.PADDLE_ENVIRONMENT || "sandbox").trim().toLowerCase();
+const PADDLE_STANDARD_PRICE_ID = process.env.PADDLE_STANDARD_PRICE_ID;
+const PADDLE_PREMIUM_PRICE_ID = process.env.PADDLE_PREMIUM_PRICE_ID;
+const PADDLE_CREDITS_50_PRICE_ID = process.env.PADDLE_CREDITS_50_PRICE_ID;
+const PADDLE_CREDITS_150_PRICE_ID = process.env.PADDLE_CREDITS_150_PRICE_ID;
+const PADDLE_CREDITS_250_PRICE_ID = process.env.PADDLE_CREDITS_250_PRICE_ID;
 const APP_BILLING_CALLBACK_URL =
   process.env.APP_BILLING_CALLBACK_URL || "https://example.com/billing/callback";
 
@@ -986,11 +994,44 @@ const lemonSqueezyRequest = async (path, options = {}) => {
 
   return data;
 };
+const paddleRequest = async (path, options = {}) => {
+  if (!PADDLE_API_KEY) {
+    throw new Error("PADDLE_API_KEY is not configured");
+  }
 
-const getActiveBillingProvider = () => (BILLING_PROVIDER === "lemon" ? "lemon" : "paystack");
+  const baseUrl = PADDLE_ENVIRONMENT === "production"
+    ? "https://api.paddle.com"
+    : "https://sandbox-api.paddle.com";
+
+  const response = await fetch(`${baseUrl}${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${PADDLE_API_KEY}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const detail = data?.error?.detail || data?.errors?.[0]?.detail || data?.message;
+    throw new Error(detail || "Paddle request failed");
+  }
+
+  return data;
+};
+
+
+const getActiveBillingProvider = () => {
+  if (BILLING_PROVIDER === "lemon") return "lemon";
+  if (BILLING_PROVIDER === "paddle") return "paddle";
+  return "paystack";
+};
 const normalizeBillingProvider = (provider = "") => {
   const value = String(provider || "").trim().toLowerCase();
   if (value === "lemon" || value === "lemonsqueezy" || value === "lemon_squeezy") return "lemon";
+  if (value === "paddle") return "paddle";
   if (value === "paystack") return "paystack";
   return getActiveBillingProvider();
 };
@@ -1005,6 +1046,13 @@ const requireBillingConfig = (provider) => {
   if (activeProvider === "lemon") {
     if (!LEMON_SQUEEZY_API_KEY || !LEMON_SQUEEZY_STORE_ID) {
       throw new Error("Lemon Squeezy billing is not configured");
+    }
+    return;
+  }
+
+  if (activeProvider === "paddle") {
+    if (!PADDLE_API_KEY) {
+      throw new Error("Paddle billing is not configured");
     }
     return;
   }
@@ -1057,6 +1105,7 @@ const BILLING_PLANS = {
     credits: 150,
     paystackPlanCode: PAYSTACK_STANDARD_PLAN_CODE,
     lemonVariantId: LEMON_SQUEEZY_STANDARD_VARIANT_ID,
+    paddlePriceId: PADDLE_STANDARD_PRICE_ID,
   },
   premium: {
     id: "premium",
@@ -1065,6 +1114,7 @@ const BILLING_PLANS = {
     credits: 250,
     paystackPlanCode: PAYSTACK_PREMIUM_PLAN_CODE,
     lemonVariantId: LEMON_SQUEEZY_PREMIUM_VARIANT_ID,
+    paddlePriceId: PADDLE_PREMIUM_PRICE_ID,
   },
 };
 
@@ -1075,6 +1125,7 @@ const CREDIT_PACKS = {
     baseAmount: 700,
     credits: 50,
     lemonVariantId: LEMON_SQUEEZY_CREDITS_50_VARIANT_ID,
+    paddlePriceId: PADDLE_CREDITS_50_PRICE_ID,
   },
   credits_150: {
     id: "credits_150",
@@ -1082,6 +1133,7 @@ const CREDIT_PACKS = {
     baseAmount: 1800,
     credits: 150,
     lemonVariantId: LEMON_SQUEEZY_CREDITS_150_VARIANT_ID,
+    paddlePriceId: PADDLE_CREDITS_150_PRICE_ID,
   },
   credits_250: {
     id: "credits_250",
@@ -1089,6 +1141,7 @@ const CREDIT_PACKS = {
     baseAmount: 2800,
     credits: 250,
     lemonVariantId: LEMON_SQUEEZY_CREDITS_250_VARIANT_ID,
+    paddlePriceId: PADDLE_CREDITS_250_PRICE_ID,
   },
 };
 const CREDIT_RULES = {
@@ -1247,6 +1300,99 @@ const createLemonCheckout = async ({ variantId, email, customData, previewText }
     provider: "lemon",
   };
 };
+const createPaddleCheckout = async ({ priceId, email, customData }) => {
+  if (!priceId) {
+    throw new Error("Paddle price ID is not configured for this item");
+  }
+  const transaction = await paddleRequest("/transactions", {
+    method: "POST",
+    body: JSON.stringify({
+      items: [
+        {
+          price_id: String(priceId),
+          quantity: 1,
+        },
+      ],
+      custom_data: {
+        ...customData,
+        email,
+      },
+    }),
+  });
+
+  return {
+    authorizationUrl: transaction?.data?.checkout?.url,
+    accessCode: transaction?.data?.id,
+    reference: customData.checkoutReference,
+    provider: "paddle",
+  };
+};
+
+const getPaddleCustomData = (event = {}) => event?.data?.custom_data || {};
+const getPaddleReference = (event = {}) =>
+  getPaddleCustomData(event)?.checkoutReference || event?.data?.id || event?.event_id || null;
+const getPaddlePriceId = (event = {}) =>
+  String(event?.data?.items?.[0]?.price?.id || event?.data?.items?.[0]?.price_id || "").trim();
+
+const getBillingPlanFromPaddleEvent = (event = {}) => {
+  const custom = getPaddleCustomData(event);
+  const metadataPlan = getBillingPlan(custom.planId);
+  if (metadataPlan) return metadataPlan;
+
+  const priceId = getPaddlePriceId(event);
+  if (!priceId) return null;
+
+  return (
+    Object.values(BILLING_PLANS).find(
+      (plan) => String(plan.paddlePriceId || "").trim() === priceId,
+    ) ?? null
+  );
+};
+
+const getCreditPackFromPaddleEvent = (event = {}) => {
+  const custom = getPaddleCustomData(event);
+  const metadataPack = getCreditPack(custom.packId);
+  if (metadataPack) return metadataPack;
+
+  const priceId = getPaddlePriceId(event);
+  if (!priceId) return null;
+
+  return (
+    Object.values(CREDIT_PACKS).find(
+      (pack) => String(pack.paddlePriceId || "").trim() === priceId,
+    ) ?? null
+  );
+};
+
+const verifyPaddleWebhookSignature = (req) => {
+  const signatureHeader = String(req.headers["paddle-signature"] || "");
+  if (!PADDLE_WEBHOOK_SECRET || !signatureHeader || !req.rawBody) return false;
+
+  const parts = Object.fromEntries(
+    signatureHeader
+      .split(";")
+      .map((part) => part.split("="))
+      .filter((part) => part.length === 2),
+  );
+  const timestamp = parts.ts;
+  const signature = parts.h1;
+
+  if (!timestamp || !signature) return false;
+
+  const signedPayload = `${timestamp}:${req.rawBody.toString("utf8")}`;
+  const expected = createHmac("sha256", PADDLE_WEBHOOK_SECRET)
+    .update(signedPayload)
+    .digest("hex");
+
+  const signatureBuffer = Buffer.from(signature, "hex");
+  const expectedBuffer = Buffer.from(expected, "hex");
+
+  return (
+    signatureBuffer.length === expectedBuffer.length &&
+    timingSafeEqual(signatureBuffer, expectedBuffer)
+  );
+};
+
 
 const verifyLemonWebhookSignature = (req) => {
   const signature = String(req.headers["x-signature"] || "");
@@ -1396,6 +1542,136 @@ const applyLemonCreditPackPayment = async (event = {}) => {
   };
 };
 
+const applyPaddlePlanPayment = async (event = {}) => {
+  if (!supabaseAdmin) {
+    throw new Error("Supabase service role is not configured");
+  }
+
+  const custom = getPaddleCustomData(event);
+  const billingPlan = getBillingPlanFromPaddleEvent(event);
+  const reference = getPaddleReference(event);
+  const userId = custom.userId;
+
+  if (!billingPlan || !reference || !userId) {
+    return { applied: false, reason: "missing_plan_reference_or_user" };
+  }
+
+  const { data: profile, error: profileError } = await supabaseAdmin
+    .from("profiles")
+    .select("id, ai_credits, payment_reference")
+    .eq("id", userId)
+    .single();
+
+  if (profileError || !profile) {
+    return { applied: false, reason: "profile_not_found" };
+  }
+
+  if (profile.payment_reference === reference) {
+    return { applied: false, reason: "already_applied" };
+  }
+
+  const attributes = event?.data || {};
+  const nextBilledAt = attributes.subscription?.next_billed_at || attributes.next_billed_at;
+  const currentPeriodEndsAt = nextBilledAt ? new Date(nextBilledAt) : addDays(new Date(), 30);
+  const existingCredits = Number(profile.ai_credits ?? 0);
+  const nextCredits = Math.max(0, existingCredits) + billingPlan.credits;
+  const subscriptionId = String(attributes.subscription_id || attributes.subscription?.id || "").trim() || null;
+  const customerId = String(attributes.customer_id || attributes.customer?.id || "").trim() || null;
+  const billingEmail = attributes.customer?.email || custom.email || null;
+
+  const { error: updateError } = await supabaseAdmin
+    .from("profiles")
+    .update({
+      plan: billingPlan.id,
+      ai_credits: nextCredits,
+      trial_used: true,
+      trial_started_at: null,
+      trial_ends_at: null,
+      subscription_status: "active",
+      subscription_provider: "paddle",
+      subscription_id: subscriptionId,
+      subscription_email_token: null,
+      customer_id: customerId,
+      payment_authorization_code: null,
+      payment_reference: reference,
+      billing_email: billingEmail,
+      cancel_at_period_end: false,
+      current_period_ends_at: currentPeriodEndsAt.toISOString(),
+      pending_plan: null,
+      pending_plan_starts_at: null,
+    })
+    .eq("id", profile.id);
+
+  if (updateError) throw updateError;
+
+  const creditUser = await getOrCreateCreditUser(profile.id, billingPlan.id);
+  creditUser.credits = nextCredits;
+  creditUser.plan = billingPlan.id;
+
+  return {
+    applied: true,
+    userId: profile.id,
+    plan: billingPlan.id,
+    remainingCredits: nextCredits,
+  };
+};
+
+const applyPaddleCreditPackPayment = async (event = {}) => {
+  if (!supabaseAdmin) {
+    throw new Error("Supabase service role is not configured");
+  }
+
+  const custom = getPaddleCustomData(event);
+  const creditPack = getCreditPackFromPaddleEvent(event);
+  const reference = getPaddleReference(event);
+  const userId = custom.userId;
+
+  if (!creditPack || !reference || !userId) {
+    return { applied: false, reason: "missing_pack_reference_or_user" };
+  }
+
+  const { data: profile, error: profileError } = await supabaseAdmin
+    .from("profiles")
+    .select("id, plan, ai_credits, payment_reference")
+    .eq("id", userId)
+    .single();
+
+  if (profileError || !profile) {
+    return { applied: false, reason: "profile_not_found" };
+  }
+
+  if (profile.payment_reference === reference) {
+    return { applied: false, reason: "already_applied" };
+  }
+
+  const attributes = event?.data || {};
+  const existingCredits = Number(profile.ai_credits ?? 0);
+  const nextCredits = Math.max(0, existingCredits) + creditPack.credits;
+  const billingEmail = attributes.customer?.email || custom.email || null;
+
+  const { error: updateError } = await supabaseAdmin
+    .from("profiles")
+    .update({
+      ai_credits: nextCredits,
+      payment_reference: reference,
+      billing_email: billingEmail,
+    })
+    .eq("id", profile.id);
+
+  if (updateError) throw updateError;
+
+  const creditUser = await getOrCreateCreditUser(profile.id, profile.plan);
+  creditUser.credits = nextCredits;
+  creditUser.plan = profile.plan;
+
+  return {
+    applied: true,
+    userId: profile.id,
+    pack: creditPack.id,
+    addedCredits: creditPack.credits,
+    remainingCredits: nextCredits,
+  };
+};
 const disableLemonSubscriptionById = async (subscriptionId) => {
   if (!subscriptionId) return { disabled: false, reason: "missing_subscription" };
 
@@ -1490,9 +1766,25 @@ const disablePaystackSubscriptionByCode = async (code, token) => {
 
   return { disabled: true };
 };
+const disablePaddleSubscriptionById = async (subscriptionId) => {
+  if (!subscriptionId) return { disabled: false, reason: "missing_subscription" };
+
+  await paddleRequest(`/subscriptions/${encodeURIComponent(subscriptionId)}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({
+      effective_from: "next_billing_period",
+    }),
+  });
+
+  return { disabled: true };
+};
 const disableBillingSubscription = async (profile = {}) => {
   if (profile.subscription_provider === "lemon") {
     return disableLemonSubscriptionById(profile.subscription_id);
+  }
+
+  if (profile.subscription_provider === "paddle") {
+    return disablePaddleSubscriptionById(profile.subscription_id);
   }
 
   return disablePaystackSubscriptionByCode(
@@ -5080,6 +5372,54 @@ app.post("/billing/lemon-webhook", async (req, res) => {
     });
   }
 });
+app.post("/billing/paddle-webhook", async (req, res) => {
+  try {
+    if (!verifyPaddleWebhookSignature(req)) {
+      return res.status(401).json({ error: "Invalid Paddle signature" });
+    }
+
+    const event = req.body;
+    const eventName = event?.event_type;
+    const custom = getPaddleCustomData(event);
+    const purpose = custom?.purpose;
+
+    if (eventName === "transaction.completed") {
+      const result =
+        purpose === "goach_credit_pack"
+          ? await applyPaddleCreditPackPayment(event)
+          : await applyPaddlePlanPayment(event);
+      return res.json({ ok: true, result });
+    }
+
+    if (eventName === "subscription.canceled") {
+      const subscriptionId = String(event?.data?.id || "").trim();
+      const customerId = String(event?.data?.customer_id || "").trim();
+      let query = supabaseAdmin.from("profiles").update({
+        subscription_status: "inactive",
+        cancel_at_period_end: false,
+      });
+
+      if (subscriptionId) {
+        query = query.eq("subscription_id", subscriptionId);
+      } else if (customerId) {
+        query = query.eq("customer_id", customerId);
+      } else {
+        return res.json({ ok: true, ignored: true, reason: "missing_subscription_or_customer" });
+      }
+
+      const { error } = await query;
+      if (error) throw error;
+      return res.json({ ok: true, result: { applied: true } });
+    }
+
+    return res.json({ ok: true, ignored: true });
+  } catch (error) {
+    console.log("PADDLE WEBHOOK ERROR:", error);
+    res.status(500).json({
+      error: error?.message || "Failed to process Paddle webhook",
+    });
+  }
+});
 const startCreditPackCheckoutHandler = async (req, res) => {
   try {
     const provider = normalizeBillingProvider(req.body?.billingProvider);
@@ -5141,6 +5481,27 @@ const startCreditPackCheckoutHandler = async (req, res) => {
       return res.json(checkout);
     }
 
+    if (provider === "paddle") {
+      const checkout = await createPaddleCheckout({
+        priceId: creditPack.paddlePriceId,
+        email,
+        customData: {
+          userId,
+          email,
+          packId: creditPack.id,
+          packName: creditPack.name,
+          credits: creditPack.credits,
+          baseAmount: creditPack.baseAmount,
+          payableAmount: Number(amount),
+          purpose: "goach_credit_pack",
+          checkoutReference: reference,
+        },
+      });
+
+      return res.json(checkout);
+    }
+
+
     const paystackData = await paystackRequest("/transaction/initialize", {
       method: "POST",
       body: JSON.stringify({
@@ -5190,6 +5551,29 @@ const verifyCreditPackCheckoutHandler = async (req, res) => {
     }
 
     if (provider === "lemon") {
+      const { data: profile, error: profileError } = await supabaseAdmin
+        .from("profiles")
+        .select("ai_credits, payment_reference")
+        .eq("id", userId)
+        .single();
+
+      if (profileError || !profile) {
+        return res.status(404).json({ error: "Profile not found" });
+      }
+
+      if (profile.payment_reference !== reference) {
+        return res.status(409).json({
+          error: "Payment is still processing. Wait a few seconds, then tap verify again.",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        remainingCredits: Number(profile.ai_credits ?? 0),
+      });
+    }
+
+    if (provider === "paddle") {
       const { data: profile, error: profileError } = await supabaseAdmin
         .from("profiles")
         .select("ai_credits, payment_reference")
@@ -5488,6 +5872,31 @@ const startPlanCheckoutHandler = async (req, res) => {
       return res.json(checkout);
     }
 
+
+    if (provider === "paddle") {
+      if (!billingPlan.paddlePriceId) {
+        return res.status(400).json({ error: "This plan is not available for Paddle checkout" });
+      }
+
+      const checkout = await createPaddleCheckout({
+        priceId: billingPlan.paddlePriceId,
+        email,
+        customData: {
+          userId,
+          email,
+          planId: billingPlan.id,
+          planName: billingPlan.name,
+          credits: billingPlan.credits,
+          baseAmount: billingPlan.baseAmount,
+          payableAmount: Number(amount),
+          purpose: "goach_plan_subscription",
+          checkoutReference: reference,
+        },
+      });
+
+      return res.json(checkout);
+    }
+
     const paystackData = await paystackRequest("/transaction/initialize", {
       method: "POST",
       body: JSON.stringify({
@@ -5540,6 +5949,32 @@ const verifyPlanCheckoutHandler = async (req, res) => {
     }
 
     if (provider === "lemon") {
+      const { data: profile, error: profileError } = await supabaseAdmin
+        .from("profiles")
+        .select("plan, subscription_status, ai_credits, current_period_ends_at, payment_reference")
+        .eq("id", userId)
+        .single();
+
+      if (profileError || !profile) {
+        return res.status(404).json({ error: "Profile not found" });
+      }
+
+      if (profile.payment_reference !== reference || profile.subscription_status !== "active") {
+        return res.status(409).json({
+          error: "Payment is still processing. Wait a few seconds, then tap verify again.",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        plan: profile.plan,
+        subscriptionStatus: profile.subscription_status,
+        currentPeriodEndsAt: profile.current_period_ends_at,
+        remainingCredits: Number(profile.ai_credits ?? 0),
+      });
+    }
+
+    if (provider === "paddle") {
       const { data: profile, error: profileError } = await supabaseAdmin
         .from("profiles")
         .select("plan, subscription_status, ai_credits, current_period_ends_at, payment_reference")
@@ -8193,3 +8628,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`AI backend running on http://0.0.0.0:${PORT}`);
 });
+
