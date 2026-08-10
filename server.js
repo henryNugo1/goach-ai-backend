@@ -40,6 +40,7 @@ const LEMON_SQUEEZY_CREDITS_50_VARIANT_ID = process.env.LEMON_SQUEEZY_CREDITS_50
 const LEMON_SQUEEZY_CREDITS_150_VARIANT_ID = process.env.LEMON_SQUEEZY_CREDITS_150_VARIANT_ID;
 const LEMON_SQUEEZY_CREDITS_250_VARIANT_ID = process.env.LEMON_SQUEEZY_CREDITS_250_VARIANT_ID;
 const PADDLE_API_KEY = process.env.PADDLE_API_KEY;
+const PADDLE_CLIENT_TOKEN = process.env.PADDLE_CLIENT_TOKEN;
 const PADDLE_WEBHOOK_SECRET = process.env.PADDLE_WEBHOOK_SECRET;
 const PADDLE_ENVIRONMENT = String(process.env.PADDLE_ENVIRONMENT || "sandbox").trim().toLowerCase();
 const PADDLE_STANDARD_PRICE_ID = process.env.PADDLE_STANDARD_PRICE_ID;
@@ -49,6 +50,8 @@ const PADDLE_CREDITS_150_PRICE_ID = process.env.PADDLE_CREDITS_150_PRICE_ID;
 const PADDLE_CREDITS_250_PRICE_ID = process.env.PADDLE_CREDITS_250_PRICE_ID;
 const APP_BILLING_CALLBACK_URL =
   process.env.APP_BILLING_CALLBACK_URL || "https://example.com/billing/callback";
+const PADDLE_CHECKOUT_URL =
+  process.env.PADDLE_CHECKOUT_URL || "https://goach-ai-backend-1.onrender.com/billing/paddle-checkout";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -1307,6 +1310,9 @@ const createPaddleCheckout = async ({ priceId, email, customData }) => {
   const transaction = await paddleRequest("/transactions", {
     method: "POST",
     body: JSON.stringify({
+      checkout: {
+        url: PADDLE_CHECKOUT_URL,
+      },
       items: [
         {
           price_id: String(priceId),
@@ -5143,6 +5149,99 @@ Use this profile context carefully:
 
 app.get("/", (req, res) => {
   res.send("AI backend is running");
+});
+
+app.get("/billing/paddle-checkout", (req, res) => {
+  const transactionId = String(req.query._ptxn || req.query.transaction_id || "").trim();
+  const env = PADDLE_ENVIRONMENT === "production" ? "production" : "sandbox";
+
+  if (!PADDLE_CLIENT_TOKEN) {
+    return res.status(500).send("Paddle checkout is not configured.");
+  }
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PIDA Checkout</title>
+  <script src="https://cdn.paddle.com/paddle/v2/paddle.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: radial-gradient(circle at 50% 20%, #24113d 0, #080812 55%, #02030a 100%);
+      color: #fff;
+      font-family: Arial, sans-serif;
+      text-align: center;
+      padding: 24px;
+    }
+    .card {
+      width: min(420px, 100%);
+      border: 1px solid rgba(96, 165, 250, 0.45);
+      border-radius: 24px;
+      background: rgba(15, 23, 42, 0.82);
+      box-shadow: 0 24px 80px rgba(0,0,0,0.42);
+      padding: 28px;
+    }
+    h1 { margin: 0 0 10px; font-size: 28px; }
+    p { color: #cbd5e1; line-height: 1.5; }
+    button {
+      margin-top: 12px;
+      border: 0;
+      border-radius: 14px;
+      padding: 14px 18px;
+      background: #60a5fa;
+      color: white;
+      font-weight: 900;
+      font-size: 16px;
+      width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>PIDA Checkout</h1>
+    <p id="status">Opening secure checkout...</p>
+    <button id="retry" style="display:none">Open Checkout</button>
+  </div>
+  <script>
+    const transactionId = ${JSON.stringify(transactionId)};
+    const statusEl = document.getElementById("status");
+    const retryButton = document.getElementById("retry");
+
+    function openCheckout() {
+      if (!transactionId) {
+        statusEl.textContent = "Checkout link is missing a transaction. Please return to PIDA and try again.";
+        return;
+      }
+
+      Paddle.Environment.set(${JSON.stringify(env)});
+      Paddle.Initialize({
+        token: ${JSON.stringify(PADDLE_CLIENT_TOKEN)},
+        checkout: {
+          settings: {
+            displayMode: "overlay",
+            theme: "dark",
+            locale: "en"
+          }
+        }
+      });
+      Paddle.Checkout.open({ transactionId });
+      retryButton.style.display = "block";
+      statusEl.textContent = "If checkout does not open, tap the button below.";
+    }
+
+    retryButton.addEventListener("click", openCheckout);
+    openCheckout();
+  </script>
+</body>
+</html>`);
 });
 
 app.post("/auth/request-password-reset", async (req, res) => {
