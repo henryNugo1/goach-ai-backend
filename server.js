@@ -1147,6 +1147,30 @@ const CREDIT_PACKS = {
     paddlePriceId: PADDLE_CREDITS_250_PRICE_ID,
   },
 };
+
+const getPaystackPidaMetadataFields = ({ itemType, itemName, credits, payableAmount }) => [
+  {
+    display_name: "App",
+    variable_name: "app",
+    value: "PIDA",
+  },
+  {
+    display_name: itemType,
+    variable_name: itemType.toLowerCase().replace(/\s+/g, "_"),
+    value: itemName,
+  },
+  {
+    display_name: "Goach credits",
+    variable_name: "goach_credits",
+    value: String(credits),
+  },
+  {
+    display_name: "Checkout total",
+    variable_name: "checkout_total",
+    value: `NGN ${Number(payableAmount || 0).toLocaleString("en-NG")}`,
+  },
+];
+
 const CREDIT_RULES = {
   free: {
     initialCredits: 0,
@@ -5618,6 +5642,12 @@ const startCreditPackCheckoutHandler = async (req, res) => {
           baseAmount: creditPack.baseAmount,
           payableAmount: Number(amount),
           purpose: "goach_credit_pack",
+          custom_fields: getPaystackPidaMetadataFields({
+            itemType: "Credit pack",
+            itemName: creditPack.name,
+            credits: creditPack.credits,
+            payableAmount: Number(amount),
+          }),
         },
       }),
     });
@@ -6013,6 +6043,12 @@ const startPlanCheckoutHandler = async (req, res) => {
           baseAmount: billingPlan.baseAmount,
           payableAmount: Number(amount),
           purpose: "goach_plan_subscription",
+          custom_fields: getPaystackPidaMetadataFields({
+            itemType: "Plan",
+            itemName: billingPlan.name,
+            credits: billingPlan.credits,
+            payableAmount: Number(amount),
+          }),
         },
       }),
     });
