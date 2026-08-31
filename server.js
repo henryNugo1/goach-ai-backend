@@ -1702,6 +1702,91 @@ const applyPaddleCreditPackPayment = async (event = {}) => {
     remainingCredits: nextCredits,
   };
 };
+
+const getPaddleSubscriptionPeriodEnd = (data = {}) =>
+  data?.current_billing_period?.ends_at ||
+  data?.next_billed_at ||
+  data?.scheduled_change?.effective_at ||
+  null;
+
+const getPaddleSubscriptionProfile = async (event = {}) => {
+  const data = event?.data || {};
+  const custom = getPaddleCustomData(event);
+  const userId = String(custom?.userId || "").trim();
+  const subscriptionId = String(data?.id || data?.subscription_id || "").trim();
+  const customerId = String(data?.customer_id || "").trim();
+
+  let query = supabaseAdmin
+    .from("profiles")
+    .select("id, plan, subscription_status, subscription_id, customer_id");
+
+  if (userId) query = query.eq("id", userId);
+  else if (subscriptionId) query = query.eq("subscription_id", subscriptionId);
+  else if (customerId) query = query.eq("customer_id", customerId);
+  else return null;
+
+  const { data: profile, error } = await query.maybeSingle();
+  if (error) throw error;
+  return profile || null;
+};
+
+const syncPaddleSubscription = async (event = {}) => {
+  if (!supabaseAdmin) {
+    throw new Error("Supabase service role is not configured");
+  }
+
+  const data = event?.data || {};
+  const profile = await getPaddleSubscriptionProfile(event);
+  if (!profile) return { applied: false, reason: "profile_not_found" };
+
+  const eventName = String(event?.event_type || "");
+  const paddleStatus = String(data?.status || "").toLowerCase();
+  const isCanceled = eventName === "subscription.canceled" || paddleStatus === "canceled";
+  const status = isCanceled
+    ? "expired"
+    : paddleStatus === "past_due"
+      ? "past_due"
+      : paddleStatus === "trialing"
+        ? "trialing"
+        : "active";
+  const billingPlan = getBillingPlanFromPaddleEvent(event);
+  const subscriptionId = String(data?.id || data?.subscription_id || "").trim() || null;
+  const customerId = String(data?.customer_id || "").trim() || null;
+  const periodEnd = getPaddleSubscriptionPeriodEnd(data);
+  const scheduledAction = String(data?.scheduled_change?.action || "").toLowerCase();
+
+  const updates = {
+    subscription_status: status,
+    subscription_provider: "paddle",
+    subscription_id: subscriptionId || profile.subscription_id,
+    customer_id: customerId || profile.customer_id,
+    cancel_at_period_end: !isCanceled && scheduledAction === "cancel",
+    current_period_ends_at: periodEnd || null,
+  };
+
+  if (billingPlan) updates.plan = billingPlan.id;
+  if (isCanceled) {
+    updates.pending_plan = null;
+    updates.pending_plan_starts_at = null;
+  }
+
+  const { error } = await supabaseAdmin
+    .from("profiles")
+    .update(updates)
+    .eq("id", profile.id);
+  if (error) throw error;
+
+  return {
+    applied: true,
+    userId: profile.id,
+    status,
+    plan: billingPlan?.id || profile.plan,
+    subscriptionId: updates.subscription_id,
+    customerId: updates.customer_id,
+    priceId: getPaddlePriceId(event) || null,
+    productId: String(data?.items?.[0]?.price?.product_id || "").trim() || null,
+  };
+};
 const disableLemonSubscriptionById = async (subscriptionId) => {
   if (!subscriptionId) return { disabled: false, reason: "missing_subscription" };
 
@@ -5514,25 +5599,13 @@ app.post("/billing/paddle-webhook", async (req, res) => {
       return res.json({ ok: true, result });
     }
 
-    if (eventName === "subscription.canceled") {
-      const subscriptionId = String(event?.data?.id || "").trim();
-      const customerId = String(event?.data?.customer_id || "").trim();
-      let query = supabaseAdmin.from("profiles").update({
-        subscription_status: "inactive",
-        cancel_at_period_end: false,
-      });
-
-      if (subscriptionId) {
-        query = query.eq("subscription_id", subscriptionId);
-      } else if (customerId) {
-        query = query.eq("customer_id", customerId);
-      } else {
-        return res.json({ ok: true, ignored: true, reason: "missing_subscription_or_customer" });
-      }
-
-      const { error } = await query;
-      if (error) throw error;
-      return res.json({ ok: true, result: { applied: true } });
+    if (
+      eventName === "subscription.created" ||
+      eventName === "subscription.updated" ||
+      eventName === "subscription.canceled"
+    ) {
+      const result = await syncPaddleSubscription(event);
+      return res.json({ ok: true, result });
     }
 
     return res.json({ ok: true, ignored: true });
@@ -5921,6 +5994,44 @@ const cancelSubscriptionHandler = async (req, res) => {
 };
 
 app.post("/billing/cancel-subscription", cancelSubscriptionHandler);
+
+app.post("/billing/paddle-portal-session", async (req, res) => {
+  try {
+    requireBillingConfig("paddle");
+    const authorization = String(req.headers.authorization || "");
+    const accessToken = authorization.startsWith("Bearer ")
+      ? authorization.slice(7).trim()
+      : "";
+    if (!accessToken) return res.status(401).json({ error: "Authentication required" });
+
+    const { data: authData, error: authError } = await supabaseAdmin.auth.getUser(accessToken);
+    const userId = authData?.user?.id;
+    if (authError || !userId) return res.status(401).json({ error: "Invalid session" });
+
+    const { data: profile, error } = await supabaseAdmin
+      .from("profiles")
+      .select("id, customer_id, subscription_provider")
+      .eq("id", userId)
+      .single();
+    if (error || !profile) return res.status(404).json({ error: "Profile not found" });
+    if (profile.subscription_provider !== "paddle" || !profile.customer_id) {
+      return res.status(400).json({ error: "Paddle customer details are missing" });
+    }
+
+    const session = await paddleRequest(
+      `/customers/${encodeURIComponent(profile.customer_id)}/portal-sessions`,
+      { method: "POST", body: JSON.stringify({}) },
+    );
+    const url = session?.data?.urls?.general?.overview;
+    if (!url) throw new Error("Paddle did not return a customer portal URL");
+    return res.json({ ok: true, url });
+  } catch (error) {
+    console.log("PADDLE PORTAL SESSION ERROR:", error);
+    return res.status(500).json({
+      error: error?.message || "Failed to create Paddle portal session",
+    });
+  }
+});
 
 const startPlanCheckoutHandler = async (req, res) => {
   try {
