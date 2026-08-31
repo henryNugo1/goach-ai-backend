@@ -5610,6 +5610,19 @@ app.post("/billing/paddle-webhook", async (req, res) => {
     });
   }
 });
+
+app.get("/billing/paddle-client-config", (_req, res) => {
+  if (!PADDLE_CLIENT_TOKEN) {
+    return res.status(503).json({ error: "Paddle client token is not configured" });
+  }
+
+  return res.json({
+    token: PADDLE_CLIENT_TOKEN,
+    environment: ["live", "production"].includes(PADDLE_ENVIRONMENT)
+      ? "production"
+      : "sandbox",
+  });
+});
 const startCreditPackCheckoutHandler = async (req, res) => {
   try {
     const provider = normalizeBillingProvider(req.body?.billingProvider);
