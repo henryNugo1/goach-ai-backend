@@ -50,9 +50,6 @@ const PADDLE_CREDITS_150_PRICE_ID = process.env.PADDLE_CREDITS_150_PRICE_ID;
 const PADDLE_CREDITS_250_PRICE_ID = process.env.PADDLE_CREDITS_250_PRICE_ID;
 const APP_BILLING_CALLBACK_URL =
   process.env.APP_BILLING_CALLBACK_URL || "https://example.com/billing/callback";
-const PADDLE_CHECKOUT_URL =
-  process.env.PADDLE_CHECKOUT_URL || "https://goach-ai-backend-1.onrender.com/billing/paddle-checkout";
-
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
@@ -1334,9 +1331,6 @@ const createPaddleCheckout = async ({ priceId, email, customData }) => {
   const transaction = await paddleRequest("/transactions", {
     method: "POST",
     body: JSON.stringify({
-      checkout: {
-        url: PADDLE_CHECKOUT_URL,
-      },
       items: [
         {
           price_id: String(priceId),
