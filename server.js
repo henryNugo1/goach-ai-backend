@@ -1002,7 +1002,7 @@ const paddleRequest = async (path, options = {}) => {
     throw new Error("PADDLE_API_KEY is not configured");
   }
 
-  const baseUrl = PADDLE_ENVIRONMENT === "production"
+  const baseUrl = ["live", "production"].includes(PADDLE_ENVIRONMENT)
     ? "https://api.paddle.com"
     : "https://sandbox-api.paddle.com";
 
