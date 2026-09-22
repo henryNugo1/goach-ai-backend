@@ -1,4 +1,7 @@
 import cors from "cors";
+import { asksToChangeSomething, waitForChangeDetails } from "./summary-change.js";
+import { wantsToKeepPlan } from "./edit-confirmation.js";
+import { resolveBodyApproach, messagesFromTranscript } from "./coach-approach.js";
 import { createHmac, timingSafeEqual } from "crypto";
 import dotenv from "dotenv";
 import express from "express";
@@ -3040,7 +3043,7 @@ const buildDurationRecommendationReply = (goalDraft = {}) => {
   const recommendation = getRecommendedDurationForGoal(goalDraft);
   const reasonText = getGoalDraftSearchText(goalDraft).includes("confidence")
     ? "That is long enough to build proof through repetition without making it feel heavy."
-    : "That gives the plan enough time to create visible progress without dragging for too long.";
+    : "We can use that as a planning period and review how the routine is working. Results and timing vary.";
 
   return `For this, I recommend ${recommendation.label}. ${reasonText} Is that okay?`;
 };
@@ -3165,10 +3168,7 @@ const goalDraftNeedsFoodAndMovementCoverage = (
   ].join(" ");
   const text = normalizeCoachTextForComparison(combinedText);
 
-  const agreedBoth =
-    /\bboth\b/.test(text) ||
-    (isMeaningfulStructuredValue(goalParts.food) &&
-      isMeaningfulStructuredValue(goalParts.workout));
+  const agreedBoth = resolveBodyApproach(messagesFromTranscript(conversationText)).approach === "both";
 
   return (
     hasBodyGoalSignal(text) &&
@@ -6424,6 +6424,7 @@ app.post("/generate-next-question", checkCredits, async (req, res) => {
       messages = [],
       existingSchedule = [],
       currentGoalMeta = null,
+      interfaceLanguage = "en",
     } = req.body;
 
     if (!goal || !String(goal).trim()) {
@@ -6466,6 +6467,9 @@ app.post("/generate-next-question", checkCredits, async (req, res) => {
       previousAssistantAskedForApproval &&
       isLikelyAcceptanceReply(latestUserMessage);
     const recentMessages = Array.isArray(messages) ? messages.slice(-16) : [];
+    const approachConversationText = (Array.isArray(messages) ? messages : [])
+      .map((item) => `${String(item?.role ?? "user").toUpperCase()}: ${String(item?.content ?? "")}`)
+      .join("\n");
     const assistantReplyCount = Array.isArray(messages)
       ? messages.filter((item) => item?.role === "assistant").length
       : 0;
@@ -6548,6 +6552,12 @@ app.post("/generate-next-question", checkCredits, async (req, res) => {
           role: "system",
           content: `
 You are Goach, an AI goal coach powered by OpenAI inside a goal-planning app.
+
+Reply language:
+- The app interface language is ${interfaceLanguage}.
+- Reply in that language unless the user clearly asks you to use another language.
+- Keep proper names, times, dates, and user-written titles unchanged.
+- Keep the JSON field names and machine-readable scheduling values in the required canonical format.
 
 Your job is not to collect form fields. Your job is to understand the user, guide them clearly, then help turn anything they want to follow into a realistic goal-card plan.
 
@@ -6635,6 +6645,7 @@ Goal-card rules:
 - If a user asks for a plan guide, full plan, quick plan, routine, or steps they can follow, build toward a goal card automatically. Do not keep asking whether to turn it into a guide.
 - If the plan has multiple parts, cover all important parts inside the goal card plan. Example: a weight-loss plan with meals and walking must include both meals and walking.
 - For food routine or meal-plan intent, after the user agrees to continue, do not explain balanced meals again. Ask the next missing goal-card detail instead.
+- User corrections override prior suggestions and draft fields. Never treat an assistant message as proof the user chose an activity. A body or weight goal alone does not mean food plus workouts. Ask their preferred approach first; do not add workouts without their choice. Answer a correction before asking duration or schedule. A yes confirms only the immediately preceding question, not earlier suggestions. Do not promise visible body changes within a fixed number of weeks.
 - Smart food flow: understand aim first: weight loss, weight gain, muscle gain, or general health. Then ask whether they want exact meals or flexible meal rules. Then ask culture/preference such as Nigerian foods, general foods, cheap foods, or restrictions. Then ask meal times if it becomes a goal card.
 - If the user wants exact meals, the final plan must name foods for each meal shift. If the user wants flexible meal rules, the final plan must give a clear formula with examples for each meal shift.
 - If the user already gave length, food style, aim, exact/flexible choice, meals/snacks, and meal times, move to start date or final summary if complete. Do not keep saying "I can".
@@ -7131,7 +7142,7 @@ Generate the next Goach reply now.`,
       selectedDaysComplete: hasDays,
       routineModeComplete: hasRoutineMode,
       sessionTimesComplete: hasSessionTime,
-      requiredPartsComplete: requiredGoalPartsCovered(goalDraft, conversationText),
+      requiredPartsComplete: requiredGoalPartsCovered(goalDraft, approachConversationText),
       goalStartDateComplete: hasStartDate,
       breaksResolved: Boolean(isOneTimeGoal || goalDraft.breaksResolved || goalDraft.breakDays.length > 0 || goalDraft.selectedDays.length > 0),
       levelResolved: Boolean(isOneTimeGoal || goalDraft.levelResolved || goalDraft.level || !goalDraft.levelNeeded),
@@ -7207,7 +7218,7 @@ Generate the next Goach reply now.`,
         return pickCoachQuestion("routineMode");
       }
       if (!checklist.requiredPartsComplete) {
-        return buildMissingRequiredPartReply(goalDraft, conversationText) || pickCoachQuestion("time");
+        return buildMissingRequiredPartReply(goalDraft, approachConversationText) || pickCoachQuestion("time");
       }
       if (!checklist.sessionTimesComplete) {
         return pickCoachQuestion("time");
@@ -7250,7 +7261,7 @@ Generate the next Goach reply now.`,
         /\b(sample week|food guide|meal guide|what about|adjust it for|cheaper foods|weight gain|weight loss)\b/i.test(reply)
       )
     ) {
-      reply = buildMissingRequiredPartReply(goalDraft, conversationText) || buildMissingReadyDetailReply();
+      reply = buildMissingRequiredPartReply(goalDraft, approachConversationText) || buildMissingReadyDetailReply();
       goalDraft.finalSummaryOffered = false;
       goalDraft.finalSummaryConfirmed = false;
     }
@@ -7406,13 +7417,29 @@ Generate the next Goach reply now.`,
       };
     }
 
-    const readyNow = checklistComplete && goalDraft.finalSummaryConfirmed;
+    // Corrections and unresolved activity choices take priority over schedule
+    // fallbacks, which must not turn an assistant suggestion into user consent.
+    const bodyApproach = resolveBodyApproach(messages);
+    const needsApproachChoice = hasBodyGoalSignal(goal) && !bodyApproach.approach;
+    if (needsApproachChoice || bodyApproach.corrected) {
+      reply = bodyApproach.corrected
+        ? "You are right. I should not assume which activities you want. Would you prefer to focus on food, daily habits, or another approach?"
+        : "What approach would you prefer for this goal: food, movement, daily habits, or something else?";
+      goalDraft.finalSummaryConfirmed = false;
+      goalDraft.finalSummaryOffered = false;
+    }
+    const waitingForChangeDetails = asksToChangeSomething(latestUserMessage);
+    if (waitingForChangeDetails) {
+      reply = "What would you like to change?";
+      Object.assign(goalDraft, waitForChangeDetails(goalDraft));
+    }
+    const readyNow = !waitingForChangeDetails && !needsApproachChoice && !bodyApproach.corrected && checklistComplete && goalDraft.finalSummaryConfirmed;
     const remainingCredits = await deductCreditsAfterSuccess(req);
 
     res.json({
       reply: readyNow ? "Your plan is ready to build now." : reply,
       hasEnoughInfo: readyNow,
-      phase: readyNow ? "ready" : String(parsed?.phase ?? "contextual"),
+      phase: waitingForChangeDetails ? "contextual" : readyNow ? "ready" : String(parsed?.phase ?? "contextual"),
       goalDraft,
       checklist,
       lockedFields: getLockedGoalDraftFields(goalDraft),
@@ -7431,7 +7458,7 @@ Generate the next Goach reply now.`,
 });
 app.post("/generate-summary", checkCredits, async (req, res) => {
   try {
-    const { goal, messages = [] } = req.body;
+    const { goal, messages = [], interfaceLanguage = "en" } = req.body;
     const userCoachContext = await getUserCoachContext(req.userId);
 
 
@@ -7456,6 +7483,11 @@ app.post("/generate-summary", checkCredits, async (req, res) => {
           role: "system",
          content: `
 You are an expert AI goal coach.
+
+Reply language:
+- Write all user-visible JSON values in ${interfaceLanguage}, unless the user clearly requests another language.
+- Keep JSON keys unchanged.
+- Keep proper names, times, dates, and user-written titles unchanged.
 
 You will receive:
 - the user's goal
@@ -7558,6 +7590,7 @@ app.post("/generate-plan", checkCredits, async (req, res) => {
   includeImages = true,
   existingSchedule = [],
   currentGoalMeta = null,
+  interfaceLanguage = "en",
 } = req.body;
 
     const existingScheduleText = formatExistingScheduleForAI(existingSchedule);
@@ -7594,6 +7627,11 @@ app.post("/generate-plan", checkCredits, async (req, res) => {
           role: "system",
           content: `
 You are an expert AI goal coach.
+
+Reply language:
+- Write all user-visible titles, explanations, labels, milestones, and coach replies in ${interfaceLanguage}, unless the user clearly requests another language.
+- Keep JSON keys and canonical scheduling values unchanged.
+- Keep proper names, times, dates, and user-written titles unchanged.
 
 You will receive:
 - the user's goal
@@ -8138,7 +8176,7 @@ const buildContextualEditInstruction = ({
 };
 app.post("/edit-plan-coach-reply", checkCredits, async (req, res) => {
   try {
-   const { goal, messages = [], currentPlan = [], currentGoalMeta = null, currentGoalContext = null, existingSchedule = [], editInstruction,} = req.body;
+   const { goal, messages = [], currentPlan = [], currentGoalMeta = null, currentGoalContext = null, existingSchedule = [], editInstruction, interfaceLanguage = "en",} = req.body;
 
     
     const existingScheduleText = formatExistingScheduleForAI(existingSchedule);
@@ -8174,6 +8212,10 @@ const userCoachContext = await getUserCoachContext(req.userId);
           role: "system",
           content: `
 You are a warm, professional AI goal coach inside a goal-planning app.
+
+Reply language:
+- Write the user-visible reply in ${interfaceLanguage}, unless the user clearly requests another language.
+- Keep JSON keys, machine-readable actions, proper names, times, dates, and user-written titles unchanged.
 
 Your job is only to chat about the user's requested edit.
 Do not generate a plan.
@@ -8280,6 +8322,16 @@ Reply as the coach. Do not generate a plan.`,
     const parsed = safeJsonParseFromResponse(text);
     const lastAssistantQuestion = getLastAssistantQuestion(messages);
     const latestEditInstruction = String(editInstruction ?? "").trim();
+    if (wantsToKeepPlan(latestEditInstruction)) {
+      const remainingCredits = await deductCreditsAfterSuccess(req);
+      return res.json({
+        reply: "Okay, I will keep your plan unchanged.",
+        canGeneratePlan: false,
+        action: "reply_only",
+        pendingEditInstruction: "",
+        remainingCredits,
+      });
+    }
     const fallbackPendingEdit = getRecentSubstantiveUserEdit(
       messages,
       latestEditInstruction,
@@ -8356,6 +8408,7 @@ const {
   editInstruction,
   includeImages = true,
   existingSchedule = [],
+  interfaceLanguage = "en",
 } = req.body;
 
     const existingScheduleText = formatExistingScheduleForAI(existingSchedule);
@@ -8400,6 +8453,11 @@ const {
           role: "system",
           content: `
 You are an expert AI goal coach editing an existing AI-created goal plan.
+
+Reply language:
+- Write all user-visible titles, explanations, labels, and coach replies in ${interfaceLanguage}, unless the user clearly requests another language.
+- Keep JSON keys, machine-readable actions, and canonical scheduling values unchanged.
+- Keep proper names, times, dates, and user-written titles unchanged.
 
 Your job:
 You are editing an existing AI-created goal plan, but you must behave like a coach first.
