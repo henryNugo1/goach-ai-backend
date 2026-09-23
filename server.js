@@ -2,6 +2,7 @@ import cors from "cors";
 import { asksToChangeSomething, waitForChangeDetails } from "./summary-change.js";
 import { wantsToKeepPlan } from "./edit-confirmation.js";
 import { resolveBodyApproach, messagesFromTranscript } from "./coach-approach.js";
+import { extractBearerToken, normalizeIdempotencyKey } from "./goach-security.js";
 import { createHmac, timingSafeEqual } from "crypto";
 import dotenv from "dotenv";
 import express from "express";
@@ -2114,7 +2115,7 @@ const isNewMonth = (lastRefillAt) => {
   );
 };
 
-const getOrCreateCreditUser = async (userId, planFromRequest = "free") => {
+const getOrCreateCreditUser = async (userId) => {
   if (!userId) {
     throw new Error("User ID required");
   }
@@ -2130,10 +2131,7 @@ const getOrCreateCreditUser = async (userId, planFromRequest = "free") => {
       throw new Error("Profile not found");
     }
 
-    const plan = getNormalizedPlan(
-      profile.plan || planFromRequest,
-      profile.subscription_status,
-    );
+    const plan = getNormalizedPlan(profile.plan, profile.subscription_status);
 
     const rules = CREDIT_RULES[plan] ?? CREDIT_RULES.free;
 
@@ -2154,7 +2152,7 @@ const getOrCreateCreditUser = async (userId, planFromRequest = "free") => {
     return user;
   }
 
-  const plan = getNormalizedPlan(planFromRequest);
+  const plan = "free";
   const rules = CREDIT_RULES[plan];
 
   let user = userCredits.get(userId);
@@ -2185,45 +2183,208 @@ const getOrCreateCreditUser = async (userId, planFromRequest = "free") => {
 };
 
 
-const checkCredits = async (req, res, next) => {
-  const userId = req.headers["x-user-id"];
-  const userPlan = req.headers["x-user-plan"] || "free";
-  const userEmail = req.headers["x-user-email"] || req.headers["x-email"] || "";
-
-  if (!userId) {
-    return res.status(401).json({ error: "User ID required" });
+const authenticateGoachUser = async (req, res, next) => {
+  if (!supabaseAdmin) {
+    return res.status(503).json({ error: "Goach authentication is not configured" });
   }
 
+  const accessToken = extractBearerToken(req.headers.authorization);
+  if (!accessToken) {
+    return res.status(401).json({ error: "Valid authentication is required" });
+  }
+
+  const { data, error } = await supabaseAdmin.auth.getUser(accessToken);
+  if (error || !data?.user?.id) {
+    return res.status(401).json({ error: "Session expired. Please sign in again." });
+  }
+
+  req.userId = data.user.id;
+  req.userEmail = data.user.email || "";
+  return next();
+};
+
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+const getStoredGoachRequest = async (userId, idempotencyKey) => {
+  const { data, error } = await supabaseAdmin
+    .from("goach_requests")
+    .select("status, response_status, response_body, updated_at")
+    .eq("user_id", userId)
+    .eq("idempotency_key", idempotencyKey)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+};
+
+const reserveGoachRequest = async (req, res) => {
+  const idempotencyKey = normalizeIdempotencyKey(req.headers["idempotency-key"]);
+  if (!idempotencyKey) {
+    res.status(400).json({ error: "A valid Idempotency-Key is required" });
+    return false;
+  }
+
+  const { error: insertError } = await supabaseAdmin.from("goach_requests").insert({
+    user_id: req.userId,
+    idempotency_key: idempotencyKey,
+    status: "processing",
+  });
+
+  if (!insertError) {
+    req.idempotencyKey = idempotencyKey;
+    return true;
+  }
+
+  if (insertError.code !== "23505") throw insertError;
+
+  let stored = await getStoredGoachRequest(req.userId, idempotencyKey);
+  for (let attempt = 0; stored?.status === "processing" && attempt < 20; attempt += 1) {
+    await sleep(250);
+    stored = await getStoredGoachRequest(req.userId, idempotencyKey);
+  }
+
+  if (stored?.status === "completed") {
+    res.status(stored.response_status || 200).json(stored.response_body || {});
+    return false;
+  }
+
+  const updatedAt = new Date(stored?.updated_at || 0).getTime();
+  if (Date.now() - updatedAt > 2 * 60 * 1000) {
+    const { error: reclaimError } = await supabaseAdmin
+      .from("goach_requests")
+      .update({ updated_at: new Date().toISOString() })
+      .eq("user_id", req.userId)
+      .eq("idempotency_key", idempotencyKey)
+      .eq("status", "processing");
+    if (reclaimError) throw reclaimError;
+    req.idempotencyKey = idempotencyKey;
+    return true;
+  }
+
+  res.set("Retry-After", "2");
+  res.status(409).json({ error: "This Goach request is still processing", retryable: true });
+  return false;
+};
+
+const releaseGoachRequest = async (req) => {
+  if (!req.idempotencyKey || !supabaseAdmin) return;
+  await supabaseAdmin
+    .from("goach_requests")
+    .delete()
+    .eq("user_id", req.userId)
+    .eq("idempotency_key", req.idempotencyKey)
+    .eq("status", "processing");
+};
+
+const installGoachResponseFinalizer = (req, res) => {
+  const sendJson = res.json.bind(res);
+  res.json = (body) => {
+    if (res.locals.goachResponseFinalizing) return res;
+    res.locals.goachResponseFinalizing = true;
+
+    Promise.resolve().then(async () => {
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        try {
+          await releaseGoachRequest(req);
+        } catch (error) {
+          console.error("GOACH REQUEST RELEASE ERROR:", error);
+        }
+        sendJson(body);
+        return;
+      }
+
+      try {
+        if (req.creditUser?.unlimitedCredits) {
+          const finalBody = {
+            ...(body && typeof body === "object" ? body : {}),
+            remainingCredits: UNLIMITED_CREDIT_BALANCE,
+          };
+          const { error } = await supabaseAdmin
+            .from("goach_requests")
+            .update({
+              status: "completed",
+              response_status: res.statusCode,
+              response_body: finalBody,
+              updated_at: new Date().toISOString(),
+            })
+            .eq("user_id", req.userId)
+            .eq("idempotency_key", req.idempotencyKey)
+            .eq("status", "processing");
+          if (error) throw error;
+          sendJson(finalBody);
+          return;
+        }
+
+        const { data, error } = await supabaseAdmin.rpc("complete_goach_request", {
+          p_user_id: req.userId,
+          p_idempotency_key: req.idempotencyKey,
+          p_cost: req.creditCost,
+          p_response_status: res.statusCode,
+          p_response_body: body && typeof body === "object" ? body : {},
+        });
+        if (error) throw error;
+
+        const completed = Array.isArray(data) ? data[0] : data;
+        req.creditUser.credits = Number(completed?.remaining_credits ?? req.creditUser.credits);
+        sendJson(completed?.response_body ?? body);
+      } catch (error) {
+        console.error("GOACH REQUEST FINALIZATION ERROR:", error);
+        try {
+          await releaseGoachRequest(req);
+        } catch (releaseError) {
+          console.error("GOACH REQUEST RELEASE ERROR:", releaseError);
+        }
+        res.status(500);
+        sendJson({ error: "Could not safely complete this Goach request. Please retry." });
+      }
+    });
+
+    return res;
+  };
+};
+
+const checkCredits = async (req, res, next) => {
+  const userId = req.userId;
+  const userEmail = req.userEmail;
+  const cost = getCost(req.path);
+  let user;
+
   if (isUnlimitedCreditUser(userId, userEmail)) {
-    req.userId = userId;
-    req.creditUser = {
+    user = {
       credits: UNLIMITED_CREDIT_BALANCE,
       plan: "tester",
       lastRefillAt: new Date().toISOString(),
       usingSupabase: false,
       unlimitedCredits: true,
     };
-    req.creditCost = 0;
-    return next();
+  } else {
+    try {
+      user = await getOrCreateCreditUser(userId);
+    } catch (error) {
+      return res.status(403).json({
+        error: error?.message || "Failed to load AI credits",
+        upgrade: true,
+        remainingCredits: 0,
+        requiredCredits: cost,
+        plan: "free",
+      });
+    }
   }
 
-  let user;
+  req.creditUser = user;
+  req.creditCost = user.unlimitedCredits ? 0 : cost;
 
-try {
-  user = await getOrCreateCreditUser(userId, userPlan);
-} catch (error) {
-  return res.status(403).json({
-    error: error?.message || "Failed to load AI credits",
-    upgrade: true,
-    remainingCredits: 0,
-    requiredCredits: getCost(req.path),
-    plan: "free",
-  });
-}
+  try {
+    if (!(await reserveGoachRequest(req, res))) return;
+  } catch (error) {
+    console.error("GOACH IDEMPOTENCY ERROR:", error);
+    return res.status(503).json({
+      error: "Goach request protection is unavailable. Please try again shortly.",
+    });
+  }
 
-const cost = getCost(req.path);
-
-  if (user.credits < cost) {
+  if (!user.unlimitedCredits && user.credits < cost) {
+    await releaseGoachRequest(req);
     return res.status(403).json({
       error: "Not enough Goach credits",
       upgrade: user.plan === "free" || user.plan === "trial",
@@ -2233,9 +2394,7 @@ const cost = getCost(req.path);
     });
   }
 
-  req.userId = userId;
-  req.creditUser = user;
-  req.creditCost = cost;
+  installGoachResponseFinalizer(req, res);
 
   next();
 };
@@ -2244,28 +2403,9 @@ const deductCreditsAfterSuccess = async (req) => {
   if (req.creditUser?.unlimitedCredits) {
     return UNLIMITED_CREDIT_BALANCE;
   }
-
-  const remainingCredits = Math.max(
-    0,
-    req.creditUser.credits - req.creditCost,
-  );
-
-  req.creditUser.credits = remainingCredits;
-
-  if (supabaseAdmin && req.userId) {
-    const { error } = await supabaseAdmin
-      .from("profiles")
-      .update({
-        ai_credits: remainingCredits,
-      })
-      .eq("id", req.userId);
-
-    if (error) {
-      throw error;
-    }
-  }
-
-  return remainingCredits;
+  // The response finalizer performs the atomic, idempotent deduction and
+  // replaces this provisional value before sending the response.
+  return req.creditUser.credits;
 };
 
 
@@ -6391,14 +6531,9 @@ app.post("/tester/activate", (req, res) => {
 });
 
 
-app.get("/credits/status", async (req, res) => {
-  const userId = req.headers["x-user-id"];
-  const userPlan = req.headers["x-user-plan"] || "free";
-  const userEmail = req.headers["x-user-email"] || req.headers["x-email"] || "";
-
-  if (!userId) {
-    return res.status(401).json({ error: "User ID required" });
-  }
+app.get("/credits/status", authenticateGoachUser, async (req, res) => {
+  const userId = req.userId;
+  const userEmail = req.userEmail;
 
   if (isUnlimitedCreditUser(userId, userEmail)) {
     return res.json({
@@ -6408,7 +6543,7 @@ app.get("/credits/status", async (req, res) => {
     });
   }
 
-  const user = await getOrCreateCreditUser(userId, userPlan);
+  const user = await getOrCreateCreditUser(userId);
 
   res.json({
     remainingCredits: user.credits,
@@ -6417,7 +6552,7 @@ app.get("/credits/status", async (req, res) => {
 });
 
 
-app.post("/generate-next-question", checkCredits, async (req, res) => {
+app.post("/generate-next-question", authenticateGoachUser, checkCredits, async (req, res) => {
   try {
     const {
       goal,
@@ -7456,7 +7591,7 @@ Generate the next Goach reply now.`,
     });
   }
 });
-app.post("/generate-summary", checkCredits, async (req, res) => {
+app.post("/generate-summary", authenticateGoachUser, checkCredits, async (req, res) => {
   try {
     const { goal, messages = [], interfaceLanguage = "en" } = req.body;
     const userCoachContext = await getUserCoachContext(req.userId);
@@ -7582,7 +7717,7 @@ Create the summary now.`,
   }
 });
 
-app.post("/generate-plan", checkCredits, async (req, res) => {
+app.post("/generate-plan", authenticateGoachUser, checkCredits, async (req, res) => {
   try {
     const {
   goal,
@@ -8174,7 +8309,7 @@ const buildContextualEditInstruction = ({
 
   return fallback || latest;
 };
-app.post("/edit-plan-coach-reply", checkCredits, async (req, res) => {
+app.post("/edit-plan-coach-reply", authenticateGoachUser, checkCredits, async (req, res) => {
   try {
    const { goal, messages = [], currentPlan = [], currentGoalMeta = null, currentGoalContext = null, existingSchedule = [], editInstruction, interfaceLanguage = "en",} = req.body;
 
@@ -8397,7 +8532,7 @@ res.json({
   }
 });
 
-app.post("/modify-plan", checkCredits, async (req, res) => {
+app.post("/modify-plan", authenticateGoachUser, checkCredits, async (req, res) => {
   try {
 const {
   goal,
