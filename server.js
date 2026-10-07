@@ -3,7 +3,10 @@ import { asksToChangeSomething, waitForChangeDetails } from "./summary-change.js
 import { wantsToKeepPlan } from "./edit-confirmation.js";
 import { resolveBodyApproach, messagesFromTranscript } from "./coach-approach.js";
 import { extractBearerToken, normalizeIdempotencyKey } from "./goach-security.js";
-import { createHmac, timingSafeEqual } from "crypto";
+import { acknowledgePlaySubscription, getPlaySubscription, parseMiniSubscription, PLAY_MINI_PRODUCT_ID } from "./google-play.js";
+import { parsePlayNotification } from "./google-play-notifications.js";
+import { OAuth2Client } from "google-auth-library";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
 import dotenv from "dotenv";
 import express from "express";
 import OpenAI from "openai";
@@ -2202,6 +2205,160 @@ const authenticateGoachUser = async (req, res, next) => {
   req.userEmail = data.user.email || "";
   return next();
 };
+
+app.post("/billing/google-play/verify-mini", authenticateGoachUser, async (req, res) => {
+  const purchaseToken = String(req.body?.purchaseToken || "").trim();
+  if (!purchaseToken || purchaseToken.length > 4096) {
+    return res.status(400).json({ error: "A valid Play purchase token is required" });
+  }
+  if (!supabaseAdmin) return res.status(503).json({ error: "Billing is not configured" });
+
+  try {
+    const purchase = await getPlaySubscription(purchaseToken);
+    const expectedAccountId = createHash("sha256").update(req.userId).digest("hex");
+    if (purchase?.externalAccountIdentifiers?.obfuscatedExternalAccountId !== expectedAccountId) {
+      return res.status(403).json({ error: "This Play purchase belongs to another Pida account" });
+    }
+    const verified = parseMiniSubscription(purchase);
+    if (!verified) {
+      return res.status(409).json({ error: "This is not a valid Pida Mini subscription" });
+    }
+
+    const { data: result, error } = await supabaseAdmin.rpc("reconcile_verified_play_mini", {
+      p_user_id: req.userId,
+      p_purchase_token: purchaseToken,
+      p_linked_token: verified.linkedPurchaseToken,
+      p_order_id: verified.orderId,
+      p_expires_at: verified.expiresAt,
+      p_state: verified.state,
+    });
+    if (error) throw error;
+
+    if (result?.entitled && purchase.acknowledgementState === "ACKNOWLEDGEMENT_STATE_PENDING") {
+      await acknowledgePlaySubscription(purchaseToken, PLAY_MINI_PRODUCT_ID);
+    }
+
+    return res.json({ ok: true, entitled: Boolean(result?.entitled), credited: Boolean(result?.credited), currentPeriodEndsAt: verified.expiresAt });
+  } catch (error) {
+    console.error("Play subscription verification failed", error?.code || error?.status || "unknown");
+    return res.status(502).json({ error: "Could not verify your Play subscription. Please retry." });
+  }
+});
+
+app.post("/billing/google-play/sync-mini", authenticateGoachUser, async (req, res) => {
+  try {
+    const { data: stored, error: lookupError } = await supabaseAdmin
+      .from("play_subscriptions")
+      .select("purchase_token")
+      .eq("user_id", req.userId)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (lookupError) throw lookupError;
+    if (!stored) return res.json({ ok: true, known: false });
+
+    const purchase = await getPlaySubscription(stored.purchase_token);
+    const verified = parseMiniSubscription(purchase);
+    if (!verified) return res.status(409).json({ error: "Stored Play purchase could not be reconciled" });
+    const expectedAccountId = createHash("sha256").update(req.userId).digest("hex");
+    if (purchase?.externalAccountIdentifiers?.obfuscatedExternalAccountId !== expectedAccountId) {
+      return res.status(403).json({ error: "Play purchase account mismatch" });
+    }
+    const { data: result, error } = await supabaseAdmin.rpc("reconcile_verified_play_mini", {
+      p_user_id: req.userId,
+      p_purchase_token: stored.purchase_token,
+      p_linked_token: verified.linkedPurchaseToken,
+      p_order_id: verified.orderId,
+      p_expires_at: verified.expiresAt,
+      p_state: verified.state,
+    });
+    if (error) throw error;
+    return res.json({ ok: true, known: true, entitled: Boolean(result?.entitled), credited: Boolean(result?.credited) });
+  } catch (error) {
+    console.error("Play subscription sync failed", error?.code || error?.status || "unknown");
+    return res.status(502).json({ error: "Could not sync your Play subscription. Please retry." });
+  }
+});
+
+const playPushVerifier = new OAuth2Client();
+
+app.post("/billing/google-play/rtdn", async (req, res) => {
+  const audience = process.env.GOOGLE_PLAY_PUBSUB_AUDIENCE;
+  const pushEmail = process.env.GOOGLE_PLAY_PUBSUB_PUSH_EMAIL;
+  if (!audience || !pushEmail || !supabaseAdmin) {
+    return res.status(503).json({ error: "Play notifications are not configured" });
+  }
+
+  try {
+    const jwt = extractBearerToken(req.headers.authorization);
+    if (!jwt) return res.sendStatus(401);
+    const ticket = await playPushVerifier.verifyIdToken({ idToken: jwt, audience });
+    const claims = ticket.getPayload();
+    if (claims?.email !== pushEmail || ![true, "true"].includes(claims.email_verified)) return res.sendStatus(403);
+  } catch {
+    return res.sendStatus(403);
+  }
+
+  const notification = parsePlayNotification(req.body);
+  if (!notification) return res.sendStatus(400);
+  if (notification.kind === "test" || notification.kind === "ignored") return res.sendStatus(204);
+
+  try {
+    const { data: stored, error: lookupError } = await supabaseAdmin
+      .from("play_subscriptions")
+      .select("purchase_token, user_id, latest_order_id")
+      .eq("purchase_token", notification.purchaseToken)
+      .maybeSingle();
+    if (lookupError) throw lookupError;
+
+    if (notification.kind === "voided") {
+      if (!stored || stored.latest_order_id !== notification.orderId) return res.sendStatus(204);
+      const { error: profileError } = await supabaseAdmin.from("profiles")
+        .update({ subscription_status: "expired", cancel_at_period_end: false })
+        .eq("id", stored.user_id)
+        .eq("subscription_provider", "google_play")
+        .eq("subscription_id", stored.purchase_token);
+      if (profileError) throw profileError;
+      const { error: ledgerError } = await supabaseAdmin.from("play_subscriptions")
+        .update({ play_state: "SUBSCRIPTION_STATE_EXPIRED", updated_at: new Date().toISOString() })
+        .eq("purchase_token", stored.purchase_token);
+      if (ledgerError) throw ledgerError;
+      return res.sendStatus(204);
+    }
+
+    const purchase = await getPlaySubscription(notification.purchaseToken);
+    const verified = parseMiniSubscription(purchase);
+    if (!verified || verified.state === "SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED") return res.sendStatus(204);
+    let owner = stored;
+    if (!owner && verified.linkedPurchaseToken) {
+      const { data: linked, error: linkedError } = await supabaseAdmin
+        .from("play_subscriptions")
+        .select("purchase_token, user_id, latest_order_id")
+        .eq("purchase_token", verified.linkedPurchaseToken)
+        .maybeSingle();
+      if (linkedError) throw linkedError;
+      owner = linked;
+    }
+    if (!owner) return res.sendStatus(204);
+    const expectedAccountId = createHash("sha256").update(owner.user_id).digest("hex");
+    const observedAccountId = purchase?.externalAccountIdentifiers?.obfuscatedExternalAccountId;
+    if (observedAccountId && observedAccountId !== expectedAccountId) return res.sendStatus(403);
+
+    const { error: reconcileError } = await supabaseAdmin.rpc("reconcile_verified_play_mini", {
+      p_user_id: owner.user_id,
+      p_purchase_token: notification.purchaseToken,
+      p_linked_token: verified.linkedPurchaseToken,
+      p_order_id: verified.orderId,
+      p_expires_at: verified.expiresAt,
+      p_state: verified.state,
+    });
+    if (reconcileError) throw reconcileError;
+    return res.sendStatus(204);
+  } catch (error) {
+    console.error("Play notification reconciliation failed", error?.code || error?.status || "unknown");
+    return res.sendStatus(503);
+  }
+});
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
