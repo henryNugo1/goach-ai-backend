@@ -5,6 +5,7 @@ import { resolveBodyApproach, messagesFromTranscript } from "./coach-approach.js
 import { extractBearerToken, normalizeIdempotencyKey } from "./goach-security.js";
 import { acknowledgePlaySubscription, getPlaySubscription, parseMiniSubscription, PLAY_MINI_PRODUCT_ID } from "./google-play.js";
 import { parsePlayNotification } from "./google-play-notifications.js";
+import { getNormalizedPlan } from "./billing-access.js";
 import { OAuth2Client } from "google-auth-library";
 import { createHash, createHmac, timingSafeEqual } from "crypto";
 import dotenv from "dotenv";
@@ -2092,13 +2093,6 @@ const disablePaystackSubscription = async (data = {}) => {
   return { applied: true };
 };
 
-const getNormalizedPlan = (plan = "free", subscriptionStatus = "") => {
-  if (["mini", "standard", "premium"].includes(plan)) return plan;
-  if (subscriptionStatus === "trialing") return "trial";
-  return "free";
-};
-
-
 const getCost = (path) => {
   if (path.includes("generate-plan")) return 5;
   if (path.includes("modify-plan")) return 3;
@@ -2126,7 +2120,7 @@ const getOrCreateCreditUser = async (userId) => {
   if (supabaseAdmin) {
     const { data: profile, error } = await supabaseAdmin
       .from("profiles")
-      .select("id, plan, ai_credits, subscription_status")
+      .select("id, plan, ai_credits, subscription_status, subscription_provider, current_period_ends_at, trial_ends_at")
       .eq("id", userId)
       .single();
 
@@ -2134,7 +2128,7 @@ const getOrCreateCreditUser = async (userId) => {
       throw new Error("Profile not found");
     }
 
-    const plan = getNormalizedPlan(profile.plan, profile.subscription_status);
+    const plan = getNormalizedPlan(profile);
 
     const rules = CREDIT_RULES[plan] ?? CREDIT_RULES.free;
 
