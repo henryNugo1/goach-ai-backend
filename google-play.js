@@ -38,7 +38,7 @@ export const acknowledgePlaySubscription = (purchaseToken, productId) =>
   );
 
 export const parseMiniSubscription = (purchase) => {
-  if (purchase?.packageName !== PLAY_PACKAGE_NAME) return null;
+  // subscriptionsv2.get is scoped to the package in the request URL; its response has no packageName.
   const states = new Set([
     "SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_CANCELED",
     "SUBSCRIPTION_STATE_IN_GRACE_PERIOD", "SUBSCRIPTION_STATE_ON_HOLD",
