@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { parseMiniSubscription } from "./google-play.js";
+import { parseMiniSubscription, parsePlaySubscription } from "./google-play.js";
 
 const activePurchase = () => ({
   subscriptionState: "SUBSCRIPTION_STATE_ACTIVE",
@@ -10,6 +10,29 @@ const activePurchase = () => ({
     latestSuccessfulOrderId: "GPA.1234-5678-9012-34567..0",
     expiryTime: new Date(Date.now() + 86400000).toISOString(),
   }],
+});
+
+test("recognizes Standard monthly without treating it as Mini", () => {
+  const purchase = activePurchase();
+  purchase.lineItems[0].productId = "pida_standard_monthly";
+  const parsed = parsePlaySubscription(purchase);
+  assert.equal(parsed?.plan, "standard");
+  assert.equal(parsed?.credits, 150);
+  assert.equal(parsed?.productId, "pida_standard_monthly");
+  assert.equal(parseMiniSubscription(purchase), null);
+  purchase.lineItems[0].offerDetails.basePlanId = "annual";
+  assert.equal(parsePlaySubscription(purchase), null);
+});
+
+test("recognizes Premium monthly and rejects an unsupported base plan", () => {
+  const purchase = activePurchase();
+  purchase.lineItems[0].productId = "pida_premium_monthly";
+  const parsed = parsePlaySubscription(purchase);
+  assert.equal(parsed?.plan, "premium");
+  assert.equal(parsed?.credits, 250);
+  assert.equal(parsed?.productId, "pida_premium_monthly");
+  purchase.lineItems[0].offerDetails.basePlanId = "annual";
+  assert.equal(parsePlaySubscription(purchase), null);
 });
 
 test("classifies Mini lifecycle without granting access during hold or expiry", () => {

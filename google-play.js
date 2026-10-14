@@ -3,6 +3,13 @@ import { GoogleAuth } from "google-auth-library";
 export const PLAY_PACKAGE_NAME = "com.nugo.pida";
 export const PLAY_MINI_PRODUCT_ID = "pida_mini_monthly";
 export const PLAY_MINI_BASE_PLAN_ID = "monthly";
+export const PLAY_STANDARD_PRODUCT_ID = "pida_standard_monthly";
+export const PLAY_PREMIUM_PRODUCT_ID = "pida_premium_monthly";
+export const PLAY_PRODUCTS = {
+  [PLAY_MINI_PRODUCT_ID]: { plan: "mini", credits: 50 },
+  [PLAY_STANDARD_PRODUCT_ID]: { plan: "standard", credits: 150 },
+  [PLAY_PREMIUM_PRODUCT_ID]: { plan: "premium", credits: 250 },
+};
 
 let auth;
 
@@ -37,7 +44,7 @@ export const acknowledgePlaySubscription = (purchaseToken, productId) =>
     "POST",
   );
 
-export const parseMiniSubscription = (purchase) => {
+export const parsePlaySubscription = (purchase) => {
   // subscriptionsv2.get is scoped to the package in the request URL; its response has no packageName.
   const states = new Set([
     "SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_CANCELED",
@@ -48,7 +55,7 @@ export const parseMiniSubscription = (purchase) => {
   if (!states.has(purchase?.subscriptionState)) return null;
 
   const lineItem = purchase.lineItems?.find(
-    (item) => item.productId === PLAY_MINI_PRODUCT_ID &&
+    (item) => PLAY_PRODUCTS[item.productId] &&
       item.offerDetails?.basePlanId === PLAY_MINI_BASE_PLAN_ID,
   );
   if (!lineItem) return null;
@@ -58,6 +65,9 @@ export const parseMiniSubscription = (purchase) => {
   const entitled = ["SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_CANCELED", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD"].includes(purchase.subscriptionState) && Boolean(expiresAt && expiresAt > new Date());
 
   return {
+    productId: lineItem.productId,
+    plan: PLAY_PRODUCTS[lineItem.productId].plan,
+    credits: PLAY_PRODUCTS[lineItem.productId].credits,
     state: purchase.subscriptionState,
     entitled,
     orderId: lineItem.latestSuccessfulOrderId || null,
@@ -65,4 +75,9 @@ export const parseMiniSubscription = (purchase) => {
     linkedPurchaseToken: purchase.linkedPurchaseToken || null,
     cancelAtPeriodEnd: purchase.subscriptionState === "SUBSCRIPTION_STATE_CANCELED",
   };
+};
+
+export const parseMiniSubscription = (purchase) => {
+  const parsed = parsePlaySubscription(purchase);
+  return parsed?.productId === PLAY_MINI_PRODUCT_ID ? parsed : null;
 };

@@ -3,7 +3,7 @@ import { asksToChangeSomething, waitForChangeDetails } from "./summary-change.js
 import { wantsToKeepPlan } from "./edit-confirmation.js";
 import { resolveBodyApproach, messagesFromTranscript } from "./coach-approach.js";
 import { extractBearerToken, normalizeIdempotencyKey } from "./goach-security.js";
-import { acknowledgePlaySubscription, getPlaySubscription, parseMiniSubscription, PLAY_MINI_PRODUCT_ID } from "./google-play.js";
+import { acknowledgePlaySubscription, getPlaySubscription, parsePlaySubscription } from "./google-play.js";
 import { parsePlayNotification } from "./google-play-notifications.js";
 import { getNormalizedPlan } from "./billing-access.js";
 import { OAuth2Client } from "google-auth-library";
@@ -2200,7 +2200,8 @@ const authenticateGoachUser = async (req, res, next) => {
   return next();
 };
 
-app.post("/billing/google-play/verify-mini", authenticateGoachUser, async (req, res) => {
+app.post(["/billing/google-play/verify-mini", "/billing/google-play/verify-standard", "/billing/google-play/verify-premium"], authenticateGoachUser, async (req, res) => {
+  const requestedPlan = req.path.slice(req.path.lastIndexOf("-") + 1);
   const purchaseToken = String(req.body?.purchaseToken || "").trim();
   if (!purchaseToken || purchaseToken.length > 4096) {
     return res.status(400).json({ error: "A valid Play purchase token is required" });
@@ -2213,13 +2214,14 @@ app.post("/billing/google-play/verify-mini", authenticateGoachUser, async (req, 
     if (purchase?.externalAccountIdentifiers?.obfuscatedExternalAccountId !== expectedAccountId) {
       return res.status(403).json({ error: "This Play purchase belongs to another Pida account" });
     }
-    const verified = parseMiniSubscription(purchase);
-    if (!verified) {
-      return res.status(409).json({ error: "This is not a valid Pida Mini subscription" });
+    const verified = parsePlaySubscription(purchase);
+    if (!verified || verified.plan !== requestedPlan) {
+      return res.status(409).json({ error: "This is not a valid Pida subscription" });
     }
 
-    const { data: result, error } = await supabaseAdmin.rpc("reconcile_verified_play_mini", {
+    const { data: result, error } = await supabaseAdmin.rpc("reconcile_verified_play_subscription", {
       p_user_id: req.userId,
+      p_product_id: verified.productId,
       p_purchase_token: purchaseToken,
       p_linked_token: verified.linkedPurchaseToken,
       p_order_id: verified.orderId,
@@ -2229,7 +2231,7 @@ app.post("/billing/google-play/verify-mini", authenticateGoachUser, async (req, 
     if (error) throw error;
 
     if (result?.entitled && purchase.acknowledgementState === "ACKNOWLEDGEMENT_STATE_PENDING") {
-      await acknowledgePlaySubscription(purchaseToken, PLAY_MINI_PRODUCT_ID);
+      await acknowledgePlaySubscription(purchaseToken, verified.productId);
     }
 
     return res.json({ ok: true, entitled: Boolean(result?.entitled), credited: Boolean(result?.credited), currentPeriodEndsAt: verified.expiresAt });
@@ -2239,12 +2241,14 @@ app.post("/billing/google-play/verify-mini", authenticateGoachUser, async (req, 
   }
 });
 
-app.post("/billing/google-play/sync-mini", authenticateGoachUser, async (req, res) => {
+app.post(["/billing/google-play/sync-mini", "/billing/google-play/sync-standard", "/billing/google-play/sync-premium"], authenticateGoachUser, async (req, res) => {
+  const requestedPlan = req.path.slice(req.path.lastIndexOf("-") + 1);
   try {
     const { data: stored, error: lookupError } = await supabaseAdmin
       .from("play_subscriptions")
-      .select("purchase_token")
+      .select("purchase_token, product_id")
       .eq("user_id", req.userId)
+      .eq("product_id", `pida_${requestedPlan}_monthly`)
       .order("updated_at", { ascending: false })
       .limit(1)
       .maybeSingle();
@@ -2252,14 +2256,15 @@ app.post("/billing/google-play/sync-mini", authenticateGoachUser, async (req, re
     if (!stored) return res.json({ ok: true, known: false });
 
     const purchase = await getPlaySubscription(stored.purchase_token);
-    const verified = parseMiniSubscription(purchase);
-    if (!verified) return res.status(409).json({ error: "Stored Play purchase could not be reconciled" });
+    const verified = parsePlaySubscription(purchase);
+    if (!verified || verified.plan !== requestedPlan) return res.status(409).json({ error: "Stored Play purchase could not be reconciled" });
     const expectedAccountId = createHash("sha256").update(req.userId).digest("hex");
     if (purchase?.externalAccountIdentifiers?.obfuscatedExternalAccountId !== expectedAccountId) {
       return res.status(403).json({ error: "Play purchase account mismatch" });
     }
-    const { data: result, error } = await supabaseAdmin.rpc("reconcile_verified_play_mini", {
+    const { data: result, error } = await supabaseAdmin.rpc("reconcile_verified_play_subscription", {
       p_user_id: req.userId,
+      p_product_id: verified.productId,
       p_purchase_token: stored.purchase_token,
       p_linked_token: verified.linkedPurchaseToken,
       p_order_id: verified.orderId,
@@ -2321,7 +2326,7 @@ app.post("/billing/google-play/rtdn", async (req, res) => {
     }
 
     const purchase = await getPlaySubscription(notification.purchaseToken);
-    const verified = parseMiniSubscription(purchase);
+    const verified = parsePlaySubscription(purchase);
     if (!verified || verified.state === "SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED") return res.sendStatus(204);
     let owner = stored;
     if (!owner && verified.linkedPurchaseToken) {
@@ -2338,8 +2343,9 @@ app.post("/billing/google-play/rtdn", async (req, res) => {
     const observedAccountId = purchase?.externalAccountIdentifiers?.obfuscatedExternalAccountId;
     if (observedAccountId && observedAccountId !== expectedAccountId) return res.sendStatus(403);
 
-    const { error: reconcileError } = await supabaseAdmin.rpc("reconcile_verified_play_mini", {
+    const { error: reconcileError } = await supabaseAdmin.rpc("reconcile_verified_play_subscription", {
       p_user_id: owner.user_id,
+      p_product_id: verified.productId,
       p_purchase_token: notification.purchaseToken,
       p_linked_token: verified.linkedPurchaseToken,
       p_order_id: verified.orderId,
