@@ -16,10 +16,10 @@ export const parsePlayNotification = (body) => {
     return { kind: "subscription", purchaseToken: subscription.purchaseToken };
   }
   const voided = payload.voidedPurchaseNotification;
-  if (voided?.productType === 1 && voided.refundType === 1 &&
-      typeof voided.purchaseToken === "string" && voided.purchaseToken.length <= 4096 &&
-      typeof voided.orderId === "string" && voided.orderId.length <= 256) {
-    return { kind: "voided", purchaseToken: voided.purchaseToken, orderId: voided.orderId };
+  if ([1, 2].includes(voided?.productType) && voided.refundType === 1 &&
+      typeof voided.purchaseToken === "string" && voided.purchaseToken.trim() && voided.purchaseToken.length <= 4096 &&
+      typeof voided.orderId === "string" && voided.orderId.trim() && voided.orderId.length <= 256) {
+    return { kind: voided.productType === 2 ? "pack-refund" : "voided", purchaseToken: voided.purchaseToken, orderId: voided.orderId };
   }
   return { kind: "ignored" };
 };

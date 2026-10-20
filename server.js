@@ -2308,6 +2308,14 @@ app.post("/billing/google-play/rtdn", async (req, res) => {
   if (notification.kind === "test" || notification.kind === "ignored") return res.sendStatus(204);
 
   try {
+    if (notification.kind === "pack-refund") {
+      const { error } = await supabaseAdmin.rpc("refund_verified_play_pack", {
+        p_purchase_token: notification.purchaseToken,
+        p_order_id: notification.orderId,
+      });
+      if (error) throw error;
+      return res.sendStatus(204);
+    }
     const { data: stored, error: lookupError } = await supabaseAdmin
       .from("play_subscriptions")
       .select("purchase_token, user_id, latest_order_id")
