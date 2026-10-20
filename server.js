@@ -3,7 +3,8 @@ import { asksToChangeSomething, waitForChangeDetails } from "./summary-change.js
 import { wantsToKeepPlan } from "./edit-confirmation.js";
 import { resolveBodyApproach, messagesFromTranscript } from "./coach-approach.js";
 import { extractBearerToken, normalizeIdempotencyKey } from "./goach-security.js";
-import { acknowledgePlaySubscription, getPlaySubscription, parsePlaySubscription } from "./google-play.js";
+import { acknowledgePlaySubscription, getPlaySubscription, parsePlaySubscription, getPlayProduct, consumePlayProduct } from "./google-play.js";
+import { createPlayCreditPackHandler } from "./google-play-credit-packs.js";
 import { parsePlayNotification } from "./google-play-notifications.js";
 import { getNormalizedPlan } from "./billing-access.js";
 import { OAuth2Client } from "google-auth-library";
@@ -2199,6 +2200,10 @@ const authenticateGoachUser = async (req, res, next) => {
   req.userEmail = data.user.email || "";
   return next();
 };
+
+app.post("/billing/google-play/verify-credit-pack", authenticateGoachUser, createPlayCreditPackHandler({
+  getPurchase: getPlayProduct, consumePurchase: consumePlayProduct, db: supabaseAdmin,
+}));
 
 app.post(["/billing/google-play/verify-mini", "/billing/google-play/verify-standard", "/billing/google-play/verify-premium"], authenticateGoachUser, async (req, res) => {
   const requestedPlan = req.path.slice(req.path.lastIndexOf("-") + 1);

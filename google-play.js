@@ -38,6 +38,12 @@ const requestPlay = async (path, method = "GET") => {
 export const getPlaySubscription = (purchaseToken) =>
   requestPlay(`purchases/subscriptionsv2/tokens/${encodeURIComponent(purchaseToken)}`);
 
+export const getPlayProduct = (purchaseToken) =>
+  requestPlay(`purchases/productsv2/tokens/${encodeURIComponent(purchaseToken)}`);
+
+export const consumePlayProduct = (purchaseToken, productId) =>
+  requestPlay(`purchases/products/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(purchaseToken)}:consume`, "POST");
+
 export const acknowledgePlaySubscription = (purchaseToken, productId) =>
   requestPlay(
     `purchases/subscriptions/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(purchaseToken)}:acknowledge`,
